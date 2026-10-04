@@ -45,7 +45,7 @@ Runs reconnaissance before committing: `uname -a`, `cat /proc/cpuinfo`,
 This is the adversary the realism work is aimed at.
 
 *What they find:* an internally consistent Debian 12.5 build server
-(`docs/09` shows 196 of 197 conformance checks passing). Against a careful
+(`docs/09` shows 197 of 198 conformance checks passing). Against a careful
 operator they will eventually find something — `docs/10` lists the specific
 signals.
 

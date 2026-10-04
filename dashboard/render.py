@@ -17,13 +17,17 @@ RULES FOR THIS MODULE
 from __future__ import annotations
 
 import html
+import os
 import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
-for _cand in (_HERE.parent / "shared", Path("/opt/honeypot-monitor/share")):
+# shared/ sits beside the package in a checkout and under
+# $STATE_DIR/share/pkg/ in an installed host (deploy/install.sh stage 8).
+_state = Path(os.environ.get("HONEYPOT_STATE_DIR") or "/opt/cowrie")
+for _cand in (_HERE.parent / "shared", _state / "share" / "pkg" / "shared"):
     if (_cand / "terminal_safety.py").is_file():
         sys.path.insert(0, str(_cand))
         break

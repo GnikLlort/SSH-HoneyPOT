@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hmac
 import io
 import json
 import os
@@ -44,6 +45,7 @@ import secrets
 import socket
 import sqlite3
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from http.cookies import SimpleCookie
@@ -54,19 +56,38 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
-for _cand in (_HERE.parent / "shared", Path("/opt/honeypot-monitor/share")):
+# shared/ sits beside the package in a checkout and under
+# $STATE_DIR/share/pkg/ in an installed host (deploy/install.sh stage 8).
+_state = Path(os.environ.get("HONEYPOT_STATE_DIR") or "/opt/cowrie")
+for _cand in (_HERE.parent / "shared", _state / "share" / "pkg" / "shared"):
     if (_cand / "terminal_safety.py").is_file():
         sys.path.insert(0, str(_cand))
         break
 
 import render as R  # noqa: E402
 from auth import Authenticator, AuthError, PermissionDenied  # noqa: E402
-from store import (EVENT_TYPES, OUTCOMES, EventFilter, Queries, Store,  # noqa: E402
-                   assess_health, iso)
+from store import (EVENT_TYPES, OUTCOMES, EventFilter, FilterError,  # noqa: E402
+                   Queries, Store, assess_health, iso)
 from terminal_safety import REDACTED, safe_log_value  # noqa: E402
 
 COOKIE_NAME = "hpm_session"
+# The login form's CSRF cookie. Separate from the session cookie, and a
+# session cookie in its own right: it must exist at the moment the form is
+# rendered and is compared on the POST (see _login_page / _do_login).
+LOGIN_CSRF_COOKIE = "hpm_login_csrf"
 MAX_EXPORT_ROWS = 50_000
+
+# Rendering one recording costs several times its size in memory: the bytes,
+# the parsed chunks and the JSON payload all exist at once. Measured at ~3x the
+# file. 64 MB -- the parser's ceiling -- is therefore ~192 MB per request, and
+# ThreadingHTTPServer has no concurrency limit, so five simultaneous viewers of
+# a large recording could ask for a gigabyte. The limit below is applied BEFORE
+# the read, because a ceiling checked inside the parser prevents nothing.
+PLAYBACK_DISPLAY_LIMIT_BYTES = 8 * 1024 * 1024
+# Bound the number of recordings rendered at once. A viewer that cannot get a
+# slot is told so, rather than queueing behind an unbounded amount of work.
+PLAYBACK_CONCURRENCY = 4
+PLAYBACK_WAIT_SECONDS = 10.0
 
 
 class Response:
@@ -92,7 +113,8 @@ def badge(text: object, css: str) -> str:
     return f'<span class="badge {css}">{R.esc(text, mask=False, limit=24)}</span>'
 
 
-def recording_badge(chunk_count: object, duplicate: object) -> str:
+def recording_badge(chunk_count: object, duplicate: object,
+                    recording_count: object = None) -> str:
     """
     Recording availability for a session row.
 
@@ -100,6 +122,16 @@ def recording_badge(chunk_count: object, duplicate: object) -> str:
     to an earlier one, so several sessions legitimately point at one file.
     """
     out = badge("recording", "info") if chunk_count else badge("none", "unk")
+    # Cowrie writes one ttylog per shell, so a session with several recordings
+    # is normal for any toolkit that opens more than one channel. Saying "3
+    # recordings" here is what stops a reviewer reading one of three
+    # transcripts and believing it is the session.
+    try:
+        count = int(recording_count or 0)
+    except (TypeError, ValueError):
+        count = 0
+    if count > 1:
+        out += " " + badge(f"{count} recordings", "info")
     if duplicate:
         out += " " + badge("shared", "unk")
     return out
@@ -132,7 +164,10 @@ class Dashboard:
 
     def __init__(self, store_root: Path, audit_file: Path | None = None,
                  idle_timeout: int = 900, hard_timeout: int = 28800,
-                 demo_mode: bool = False) -> None:
+                 demo_mode: bool = False,
+                 playback_display_limit: int = PLAYBACK_DISPLAY_LIMIT_BYTES,
+                 playback_concurrency: int = PLAYBACK_CONCURRENCY,
+                 playback_wait: float = PLAYBACK_WAIT_SECONDS) -> None:
         # Evidence is opened READ-ONLY. SQLite enforces it (mode=ro plus
         # PRAGMA query_only), so a bug here cannot rewrite or delete evidence --
         # the write is rejected by the driver, not by this program's restraint.
@@ -142,14 +177,28 @@ class Dashboard:
         # The evidence tables are written by ingest.py, never by this process.
         self.auth_store = Store(store_root)
         self.queries = Queries(self.readonly_store)
-        self.queries = Queries(self.readonly_store)
         self.auth = Authenticator(self.auth_store, idle_timeout=idle_timeout,
                                   hard_timeout=hard_timeout, audit_file=audit_file,
                                   demo_mode=demo_mode)
         self.demo_mode = demo_mode
+        # 0 is allowed and means "never render a recording in the browser";
+        # the production value is PLAYBACK_DISPLAY_LIMIT_BYTES.
+        self.playback_display_limit = max(0, int(playback_display_limit))
+        self.playback_wait = float(playback_wait)
+        self.playback_slots = threading.BoundedSemaphore(max(1, int(playback_concurrency)))
         self.nonce = secrets.token_urlsafe(16)
         self.csrf_secret = secrets.token_bytes(32)
         self.started = time.time()
+        # Housekeeping that previously never ran (AUDIT F-09): expired sessions
+        # were deleted only when their exact token was presented again, so the
+        # table grew without bound on a long-lived monitoring host. Expiry was
+        # always enforced on validation; this is the row cleanup beside it.
+        try:
+            purged = self.auth.purge_expired_sessions()
+            if purged:
+                sys.stderr.write(f"[dashboard] purged {purged} expired session(s)\n")
+        except sqlite3.Error as exc:
+            sys.stderr.write(f"[dashboard] session purge failed: {safe_log_value(exc, 200)}\n")
 
     # -- csrf --------------------------------------------------------------
     def csrf_for(self, token: str) -> str:
@@ -258,12 +307,41 @@ class Handler(BaseHTTPRequestHandler):
         morsel = jar.get(COOKIE_NAME)
         return morsel.value if morsel else ""
 
-    def _set_cookie(self, token: str, max_age: int) -> tuple[str, str]:
-        parts = [f"{COOKIE_NAME}={token}", "Path=/", "HttpOnly",
+    def _set_cookie(self, token: str, max_age: int,
+                    name: str = COOKIE_NAME) -> tuple[str, str]:
+        parts = [f"{name}={token}", "Path=/", "HttpOnly",
                  f"SameSite={self.same_site}", f"Max-Age={max_age}"]
         if self.secure_cookies:
             parts.append("Secure")
         return ("Set-Cookie", "; ".join(parts))
+
+    def _login_csrf_cookie(self, value: str) -> tuple[str, str]:
+        """
+        The login form's double-submit cookie.
+
+        No Max-Age: it is a session cookie that lives exactly as long as the
+        sign-in page the browser is looking at. Presenting it back proves the
+        POST came from a page this server rendered for that browser, which is
+        the property a hidden constant token never had -- the previous token was
+        HMAC(process_secret, "") and therefore identical for every visitor.
+        """
+        parts = [f"{LOGIN_CSRF_COOKIE}={value}", "Path=/", "HttpOnly",
+                 f"SameSite={self.same_site}"]
+        if self.secure_cookies:
+            parts.append("Secure")
+        return ("Set-Cookie", "; ".join(parts))
+
+    def _login_csrf_cookie_value(self) -> str:
+        raw = self.headers.get("Cookie", "")
+        if not raw:
+            return ""
+        try:
+            jar = SimpleCookie()
+            jar.load(raw)
+        except Exception:  # noqa: BLE001 - a malformed cookie is not fatal
+            return ""
+        morsel = jar.get(LOGIN_CSRF_COOKIE)
+        return morsel.value if morsel else ""
 
     def _security_headers(self) -> list[tuple[str, str]]:
         return [
@@ -335,7 +413,10 @@ class Handler(BaseHTTPRequestHandler):
         if not token:
             return None
         try:
-            return self.app.auth.validate_session(token)
+            # The user agent is bound to the session at login, so a cookie
+            # replayed from a different client is refused and audited.
+            return self.app.auth.validate_session(
+                token, user_agent=self.headers.get("User-Agent", ""))
         except sqlite3.Error as exc:
             sys.stderr.write(f"[dashboard] session lookup failed: {safe_log_value(exc, 200)}\n")
             return None
@@ -373,6 +454,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         try:
             self._route_get()
+        except FilterError as exc:
+            # A filter that cannot be honoured is an operator error with a fix,
+            # not an internal fault. It gets a 400 and the reason, never a
+            # silently widened result set.
+            self._bad_filter(exc)
         except Exception as exc:  # noqa: BLE001 - never leak a traceback to a browser
             self._fail(exc)
 
@@ -422,6 +508,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         try:
             self._route_post()
+        except FilterError as exc:
+            # Reachable through /export, whose query string is a filter like any
+            # other. An unparsable bound must not export more than was asked for.
+            self._bad_filter(exc)
         except Exception as exc:  # noqa: BLE001
             self._fail(exc)
 
@@ -430,7 +520,17 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0") or 0)
         except ValueError:
             length = 0
-        if length <= 0 or length > 1_000_000:
+        if length <= 0:
+            return {}
+        if length > 1_000_000:
+            # The body is deliberately NOT read, and the connection is closed
+            # instead. The unread bytes would otherwise remain in the socket and
+            # be parsed as the next request on a keep-alive connection -- the
+            # classic request-smuggling setup, harmless behind today's socat
+            # byte-forwarder but not the moment a reverse proxy is put in front.
+            # Draining would also work; closing is the version with no bound to
+            # get wrong on a slow sender.
+            self.close_connection = True
             return {}
         raw = self.rfile.read(length).decode("utf-8", "replace")
         parsed = parse_qs(raw, keep_blank_values=True)
@@ -477,8 +577,28 @@ class Handler(BaseHTTPRequestHandler):
         totp = (form.get("totp") or "").strip()
         src_ip = self._client_ip()
 
+        # The check the previous code only appeared to make: /login was routed
+        # before the CSRF gate and never validated a token, while the form
+        # still rendered one. Login CSRF (signing a victim into an account the
+        # attacker controls) then attributes the victim's actions to that
+        # account in the audit trail -- which is the record this tool exists to
+        # get right.
+        supplied = form.get("csrf", "")
+        expected = self._login_csrf_cookie_value()
+        if not expected or not supplied or not hmac.compare_digest(expected, supplied):
+            self.app.auth.audit("unknown", "csrf.rejected", target="/login",
+                                detail="login form token missing or not bound to this browser",
+                                src_ip=src_ip)
+            self._send(self._login_page(
+                error="This sign-in form could not be verified as coming from your "
+                      "browser. Reload the page and try again.",
+                status=403))
+            return
+
         try:
-            principal, token = self.app.auth.login(username, password, totp, src_ip=src_ip)
+            principal, token = self.app.auth.login(
+                username, password, totp, src_ip=src_ip,
+                user_agent=self.headers.get("User-Agent", ""))
         except AuthError as exc:
             self._send(html_response(self._login_page(error=str(exc)), status=401))
             return
@@ -486,14 +606,21 @@ class Handler(BaseHTTPRequestHandler):
         idle = self.app.auth.idle_timeout
         self._send(redirect("/", [self._set_cookie(token, idle)]))
 
-    def _login_page(self, error: str = "", notice: str = "") -> Response:
+    def _login_page(self, error: str = "", notice: str = "",
+                    status: int | None = None) -> Response:
         if not notice and self.app.demo_mode:
             notice = ("DEMONSTRATION MODE: the authenticator step is not enforced. "
                       "This build is for local evaluation only and must not be "
                       "deployed.")
-        doc = R.with_csrf(R.login_page(self.app.nonce, error=error, notice=notice),
-                          self.app.csrf_for(""))
-        return html_response(doc, status=200 if not error else 401)
+        # One token per page render, bound to the cookie set with this response.
+        # It is not derived from a constant secret, so every visitor gets a
+        # different one and only the browser holding the cookie can use it.
+        token = secrets.token_urlsafe(32)
+        doc = R.with_csrf(R.login_page(self.app.nonce, error=error, notice=notice), token)
+        if status is None:
+            status = 200 if not error else 401
+        return Response(doc.encode("utf-8"), status=status,
+                        headers=[self._login_csrf_cookie(token)])
 
     # -- pages -------------------------------------------------------------
     def _overview(self, principal) -> str:
@@ -701,7 +828,7 @@ class Handler(BaseHTTPRequestHandler):
             f'<td class="nowrap">{R.fmt_duration(s["duration_ms"])}</td>'
             f'<td class="nowrap">{int(s["command_count"])}</td>'
             f'<td class="nowrap">{int(s["transfer_count"])}</td>'
-            f'<td>{recording_badge(s["chunk_count"], s["recording_duplicate"])}</td>'
+            f'<td>{recording_badge(s["chunk_count"], s["recording_duplicate"], s.get("recording_count"))}</td>'
             f'<td><a href="/session/{quote(str(s["sensor"]))}/{quote(str(s["session_id"]))}">'
             f'{R.esc(s["session_id"], limit=24)}</a></td>'
             f'</tr>' for s in rows) or (
@@ -732,6 +859,17 @@ exists: an authentication attempt that never reached a shell is still evidence.<
                            self.app.csrf_for(principal.session_token))
 
     # -- session detail ----------------------------------------------------
+    def _wanted_recording(self) -> str:
+        """The ?sha= selection, validated as hex. The store re-checks it."""
+        try:
+            raw = parse_qs(urlsplit(self.path).query).get("sha", [""])[0]
+        except Exception:  # noqa: BLE001 - a malformed query is not fatal
+            return ""
+        raw = (raw or "").strip().lower()
+        if len(raw) != 64 or any(ch not in "0123456789abcdef" for ch in raw):
+            return ""
+        return raw
+
     def _split_path(self, path: str, prefix: str) -> tuple[str, str]:
         rest = path[len(prefix):].strip("/")
         bits = rest.split("/")
@@ -740,13 +878,21 @@ exists: an authentication attempt that never reached a shell is still evidence.<
         from urllib.parse import unquote
         return unquote(bits[0]), unquote(bits[1])
 
-    def _session_bundle(self, sensor: str, session_id: str) -> dict | None:
+    def _session_bundle(self, sensor: str, session_id: str,
+                        principal=None, wanted_sha: str = "") -> dict | None:
         """
         Assemble everything the viewer needs for one session.
 
         The recording is read from the store's own recording directory: the
         SHA-256 is validated as hex and confined to that directory, so a
         poisoned database value cannot become a path traversal.
+
+        Rendering is bounded twice: a recording above the display limit is
+        described but not read, and only a few recordings are rendered at once.
+        Both exist because the renderer builds the bytes, the parsed chunks and
+        the JSON payload simultaneously, so the memory cost is a multiple of
+        the file size -- on the monitoring host, driven by whatever an attacker
+        chose to type.
         """
         q = self.app.queries
         session = q.session(sensor, session_id)
@@ -755,34 +901,118 @@ exists: an authentication attempt that never reached a shell is still evidence.<
         chunks: list[dict] = []
         recorded = False
         note = ""
-        sha = session.get("recording_sha256") or ""
+        size = None
+        too_large = False
+
+        # A session can name several recordings: Cowrie starts a ttylog per
+        # shell, so a client that opens more than one channel on a single
+        # connection (ssh -M, paramiko, most scripted toolkits) produces one per
+        # command. Show all of them, and let ?sha= choose which to render.
+        listed = q.session_recordings(sensor, session_id)
+        recordings: list[dict] = []
+        for rec in listed:
+            present = q.recording_path(str(rec["sha256"])) is not None
+            recordings.append({"sha256": str(rec["sha256"]),
+                               "ordinal": int(rec["ordinal"] or 0),
+                               "bytes": int(rec.get("bytes") or 0),
+                               "duplicate": bool(rec.get("duplicate")),
+                               "chunk_count": rec.get("chunk_count"),
+                               "duration_ms": rec.get("duration_ms"),
+                               "present": present})
+
+        # The default is the session's primary recording when it is one of the
+        # listed ones, else the first. An unknown ?sha= is refused by the
+        # caller rather than silently falling back to a different recording:
+        # showing recording 3 when 7 was asked for is how a review reaches the
+        # wrong conclusion.
+        primary = str(session.get("recording_sha256") or "")
+        shas = [r["sha256"] for r in recordings]
+        sha = ""
+        if wanted_sha:
+            if wanted_sha in shas:
+                sha = wanted_sha
+            else:
+                return {"session": session, "chunks": [], "recorded": False,
+                        "note": "", "sha": "", "bytes": None, "too_large": False,
+                        "recordings": recordings, "invalid_sha": wanted_sha}
+        elif primary and primary in shas:
+            sha = primary
+        elif shas:
+            sha = shas[0]
+
         if sha:
             path = q.recording_path(sha)
             if path is not None:
-                from ttylog import derive_transcript, parse_ttylog_bytes
-                data = path.read_bytes()
-                parsed = parse_ttylog_bytes(data, source=sha[:12])
+                # stat() BEFORE read_bytes(). The parser's own size ceiling used
+                # to be the only check, and by the time the parser sees the file
+                # it is already in memory -- along with the chunks and the JSON
+                # built on top of it. This is the check that actually bounds the
+                # request; the parser's remains as the belt to these braces.
+                try:
+                    size = path.stat().st_size
+                except OSError:
+                    size = None
+                if size is not None and size > self.app.playback_display_limit:
+                    recorded = True
+                    too_large = True
+                    note = (
+                        f"This recording is {R.fmt_bytes(size)}, above the "
+                        f"{R.fmt_bytes(self.app.playback_display_limit)} display limit, so "
+                        f"it is not rendered here. Nothing has been changed or truncated "
+                        f"in the store: verify the file by its SHA-256 and analyse it "
+                        f"offline in a disposable environment (docs/06).")
+                elif not self.app.playback_slots.acquire(timeout=self.app.playback_wait):
+                    recorded = True
+                    note = (
+                        "The playback renderer is busy with other large recordings, so "
+                        "this one was not rendered. Try again in a moment; nothing is "
+                        "lost, and the recording itself is untouched.")
+                    if principal is not None:
+                        self.app.auth.audit(
+                            principal.username, "view.recording.deferred",
+                            target=f"{sensor}/{session_id}", role=principal.role,
+                            detail="playback slots exhausted", src_ip=self._client_ip())
+                else:
+                    try:
+                        from ttylog import derive_transcript, parse_ttylog_bytes
+                        data = path.read_bytes()
+                        parsed = parse_ttylog_bytes(data, source=sha[:12])
+                    finally:
+                        # Released in a finally: an exception while parsing a
+                        # hostile recording must not leak a slot permanently.
+                        self.app.playback_slots.release()
+                    recorded = True
+                    chunks = [{"offset_ms": c.offset_ms, "direction": c.direction,
+                               "text": c.text} for c in parsed]
+            elif any(r["sha256"] == sha and r["duplicate"] for r in recordings):
                 recorded = True
-                chunks = [{"offset_ms": c.offset_ms, "direction": c.direction,
-                           "text": c.text} for c in parsed]
-            elif session.get("recording_duplicate"):
-                recorded = True
-                note = ("This session's recording was byte-identical to an earlier one, so "
-                        "Cowrie stored it once under that earlier session's hash. Find the "
+                note = ("This recording was byte-identical to an earlier one, so Cowrie "
+                        "stored it once under that earlier session's hash. Find the "
                         "session with the same recording hash to view it.")
             else:
-                note = "The recording for this session is missing from the monitoring store."
+                note = "This recording is missing from the monitoring store."
+        elif recordings:
+            note = ("The recordings for this session are listed, but none of them is "
+                    "present in the monitoring store yet.")
         else:
             note = "No recording was captured for this session."
         return {"session": session, "chunks": chunks, "recorded": recorded,
-                "note": note, "sha": sha}
+                "note": note, "sha": sha, "bytes": size, "too_large": too_large,
+                "recordings": recordings, "invalid_sha": ""}
 
     def _session_api(self, principal, path: str) -> Response:
         sensor, session_id = self._split_path(path, "/api/session/")
-        bundle = self._session_bundle(sensor, session_id)
+        wanted = self._wanted_recording()
+        bundle = self._session_bundle(sensor, session_id, principal, wanted)
         if bundle is None:
             return Response(b'{"error":"not found"}', status=404,
                             ctype="application/json; charset=utf-8")
+        if bundle.get("invalid_sha"):
+            # Explicitly refusing beats quietly serving a different recording.
+            return Response(
+                json.dumps({"error": "no such recording for this session",
+                            "sha256": bundle["invalid_sha"]}).encode("utf-8"),
+                status=404, ctype="application/json; charset=utf-8")
         # The API returns sanitised text, never raw bytes: the same treatment
         # the HTML path gets. A recording is untrusted input on both paths.
         from terminal_safety import safe_text
@@ -793,6 +1023,10 @@ exists: an authentication attempt that never reached a shell is still evidence.<
                        for c in bundle["chunks"]],
             "recorded": bundle["recorded"],
             "note": bundle["note"],
+            "bytes": bundle["bytes"],
+            "too_large": bundle["too_large"],
+            "sha256": bundle["sha"],
+            "recordings": bundle["recordings"],
         }
         self.app.auth.audit(principal.username, "view.recording",
                             target=f"{sensor}/{session_id}",
@@ -803,7 +1037,14 @@ exists: an authentication attempt that never reached a shell is still evidence.<
 
     def _session_detail(self, principal, path: str) -> Response:
         sensor, session_id = self._split_path(path, "/session/")
-        bundle = self._session_bundle(sensor, session_id)
+        bundle = self._session_bundle(sensor, session_id, principal,
+                                      self._wanted_recording())
+        if bundle is not None and bundle.get("invalid_sha"):
+            return html_response(R.with_csrf(
+                R.page("Not found",
+                       '<h1>No such recording</h1><div class="notice warn">That '
+                       'recording hash is not one of this session\'s recordings.</div>',
+                       self.app.nonce, principal), ""), status=404)
         if bundle is None:
             return html_response(R.with_csrf(
                 R.page("Not found",
@@ -863,7 +1104,8 @@ exists: an authentication attempt that never reached a shell is still evidence.<
             for t in transfers]
 
         payload = {"chunks": chunk_payload, "transcript": transcript,
-                   "transfers": transfer_payload, "recorded": bundle["recorded"]}
+                   "transfers": transfer_payload, "recorded": bundle["recorded"],
+                   "too_large": bundle["too_large"], "bytes": bundle["bytes"]}
 
         unmask_link = ""
         if bundle["note"]:
@@ -874,6 +1116,55 @@ exists: an authentication attempt that never reached a shell is still evidence.<
         else:
             unmask_link += ('<div class="sub">Captured secrets are masked. Analysts can '
                             'reveal them, and doing so is audited.</div>')
+
+        recs = bundle["recordings"]
+        current_ordinal = next(
+            (i for i, r in enumerate(recs) if r["sha256"] == bundle["sha"]), 0)
+        if bundle["sha"]:
+            bits = [R.esc(bundle["sha"], mask=False, limit=64)]
+            if len(recs) > 1:
+                bits.append(f'<span class="sub">recording {current_ordinal + 1} '
+                            f'of {len(recs)}</span>')
+            chosen = next((r for r in recs if r["sha256"] == bundle["sha"]), None)
+            if chosen and chosen["duplicate"]:
+                bits.append('<span class="sub">shared with an earlier session</span>')
+            if chosen and not chosen["present"]:
+                bits.append('<span class="sub">not present in this store</span>')
+            recording_kv = " ".join(bits)
+        else:
+            recording_kv = "(none)"
+
+        # More than one recording is normal, not exotic: Cowrie starts a ttylog
+        # per shell, so a scripted client on one connection produces one per
+        # command. Listing them all is the difference between "this session has
+        # a recording" and "this session has eight, and you are looking at the
+        # third".
+        recording_picker = ""
+        if len(recs) > 1:
+            rows = ""
+            for r in recs:
+                mark_open = "<b>" if r["sha256"] == bundle["sha"] else ""
+                mark_close = "</b>" if r["sha256"] == bundle["sha"] else ""
+                facts = R.fmt_bytes(r["bytes"])
+                if r["chunk_count"] is not None:
+                    facts += f' &middot; {int(r["chunk_count"])} chunks'
+                if r["duplicate"]:
+                    facts += " &middot; duplicate"
+                if not r["present"]:
+                    facts += " &middot; missing from this store"
+                link = (f'/session/{quote(str(sensor))}/{quote(str(session_id))}'
+                        f'?sha={quote(r["sha256"])}')
+                rows += (f'<li>{mark_open}<a href="{link}">{r["ordinal"] + 1}. '
+                         f'{R.esc(r["sha256"], mask=False, limit=64)}</a>{mark_close} '
+                         f'<span class="sub">{facts}</span></li>')
+            recording_picker = (
+                '<div class="panel"><div class="k">Recordings for this session '
+                f'({len(recs)})</div>'
+                f'<ul class="sub" style="margin:6px 0 0 18px">{rows}</ul>'
+                '<div class="sub" style="margin-top:6px">Cowrie starts a recording per '
+                'shell, so a client that opened several channels on one connection has '
+                'one per command. The one shown above is selected; the others are here.'
+                '</div></div>')
 
         body = f"""
 <h1>Session {R.esc(session_id, limit=64)}</h1>
@@ -892,11 +1183,11 @@ exists: an authentication attempt that never reached a shell is still evidence.<
     <div class="k">commands</div><div class="v">{int(s["command_count"])}</div>
     <div class="k">transfers</div><div class="v">{int(s["transfer_count"])}</div>
     <div class="k">recording</div><div class="v">
-      {R.esc(bundle["sha"], mask=False, limit=64) if bundle["sha"] else "(none)"}
-      {"" if not s["recording_duplicate"] else " (shared with an earlier session)"}
+      {recording_kv}
     </div>
   </div>
 </div>
+{recording_picker}
 
 <div class="toolbar">
   <button id="play">Play</button>
@@ -1248,7 +1539,8 @@ role has any.
             rows, total = self.app.queries.sessions(f)
             columns = ["sensor", "session_id", "src_ip", "src_port", "started", "ended",
                        "duration_ms", "username", "login_result", "client_version",
-                       "command_count", "transfer_count", "recording_sha256"]
+                       "command_count", "transfer_count", "recording_sha256",
+                       "recording_count"]
         elif kind == "transfers":
             rows, total = self.app.queries.transfers(f)
             columns = ["sensor", "session_id", "timestamp", "event", "filename", "sha256",
@@ -1307,6 +1599,30 @@ role has any.
         ])
 
     # -- errors ------------------------------------------------------------
+    def _bad_filter(self, exc: Exception) -> None:
+        """Report an unusable filter. The request is refused, not widened."""
+        message = R.esc(str(exc), limit=300)
+        sys.stderr.write(f"[dashboard] rejected filter: {safe_log_value(exc, 300)}\n")
+        try:
+            principal = self._principal()
+        except Exception:  # noqa: BLE001
+            principal = None
+        if principal is None:
+            self._send(Response(f"bad request: {exc}\n".encode("utf-8"), status=400,
+                                ctype="text/plain; charset=utf-8"))
+            return
+        self.app.auth.audit(principal.username, "filter.rejected",
+                            detail=safe_log_value(exc, 200), role=principal.role,
+                            src_ip=self._client_ip())
+        doc = R.page("Bad filter",
+                     f'<h1>That filter cannot be used</h1>'
+                     f'<div class="notice crit">{message}</div>'
+                     f'<p class="sub">No query was run, and no results were returned. '
+                     f'Correct the value and search again.</p>',
+                     self.app.nonce, principal)
+        self._send(html_response(R.with_csrf(doc, self.app.csrf_for(principal.session_token)),
+                                 status=400))
+
     def _fail(self, exc: Exception) -> None:
         """
         Never leak a traceback or an internal path to a browser.
@@ -1412,6 +1728,46 @@ def parse_listen(spec: str) -> tuple[str, object]:
     return "tcp", (host, int(port))
 
 
+def relaxed_controls(args, kind: str, address) -> list[str]:
+    """
+    Every control this invocation has relaxed, as a list.
+
+    One warning printed per flag, at the moment each flag is handled, is how an
+    operator misses the one that matters: the message scrolls past during
+    startup and the running configuration is never stated anywhere as a whole.
+    (The previous code also had a comment claiming the server refuses to
+    combine --demo-mode with a non-loopback bind. It refuses only without the
+    acknowledgement flag, so the claim was false; see AUDIT F-08.) Returning a
+    list makes the set enumerable, printable in one place, and testable.
+    """
+    relaxed: list[str] = []
+    if getattr(args, "demo_mode", False):
+        relaxed.append("--demo-mode: the authenticator step is NOT enforced")
+    if kind == "tcp" and address and address[0] not in ("127.0.0.1", "::1", "localhost"):
+        relaxed.append(f"non-loopback bind {address[0]}:{address[1]}: anyone who can "
+                       f"reach that interface can see captured credentials")
+    if getattr(args, "allow_framing", False):
+        relaxed.append("--allow-framing: no X-Frame-Options, so the interface may be framed")
+    if getattr(args, "relax_cookie_policy", False):
+        relaxed.append("--relax-cookie-policy: SameSite=None, so cross-site requests "
+                       "carry the session cookie")
+    if getattr(args, "no_secure_cookies", False):
+        relaxed.append("--no-secure-cookies: the session cookie travels over plain HTTP too")
+    return relaxed
+
+
+def print_relaxed_controls(items: list[str]) -> None:
+    if not items:
+        return
+    print("")
+    print("RELAXED CONTROLS IN EFFECT -- this configuration is for local evaluation")
+    print("only; none of the following may be true for a deployment:")
+    for item in items:
+        print(f"  * {item}")
+    print("")
+    sys.stdout.flush()
+
+
 def bootstrap_store(store_root: Path) -> None:
     Store(store_root)
 
@@ -1484,9 +1840,6 @@ def main() -> int:
     Handler.secure_cookies = not args.no_secure_cookies
     if args.relax_cookie_policy:
         Handler.same_site = "None"
-        print("warning: SameSite=None. Cross-site requests will carry the session "
-              "cookie.\n         This is for looking at the interface locally. Do not "
-              "deploy it.", file=sys.stderr)
 
     if kind == "unix":
         sock_path = Path(str(address))
@@ -1500,12 +1853,7 @@ def main() -> int:
         print(f"honeypot dashboard on http://{address[0]}:{address[1]} (store: {store_root})")
 
     print("read-only: no shell, no command execution, no access to the honeypot.")
-    if args.demo_mode:
-        print("WARNING: --demo-mode is active. The authenticator step is NOT enforced.\n"
-              "         Local evaluation only. Never expose this.")
-    if not Handler.secure_cookies:
-        print("WARNING: --no-secure-cookies is set. Use only over loopback or TLS.",
-              file=sys.stderr)
+    print_relaxed_controls(relaxed_controls(args, kind, address))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -28,12 +28,15 @@ the honest summary.
 | [12 — QEMU high-interaction design](12-qemu-high-interaction.md) | The optional later-phase guest pool (design only, not built) |
 | [13 — LLM mode review](13-llm-mode-review.md) | Why LLM mode is off, and the conditions for turning it on |
 | [14 — Operations runbook](14-operations-runbook.md) | Day-to-day operation, alert response, maintenance, incident response |
+| [15 — Monitoring dashboard](15-monitoring-dashboard.md) | The off-host reviewer: roles, limits, what it cannot do |
 
 Related material outside `docs/`:
 
 * `deploy/aws/security-groups.md` — security groups, routing, IAM, verification
 * `ops/alerts/rules.md` — alert rules, thresholds and response
 * `deploy/versions.env` — the single source of every version pin
+* `AUDIT.md` — adversarial audit of the dashboard and the package: 14 findings,
+  each with the proof and the test that now guards it
 
 ---
 
@@ -63,7 +66,7 @@ program that emulates a shell; it parses commands, it does not run them.
 **Proven, with evidence in `docs/09-test-results.md`:**
 
 * The synthetic host is internally consistent under ordinary discovery
-  commands — 196 of 197 automated conformance checks pass, across identity,
+  commands — 197 of 198 automated conformance checks pass, across identity,
   CPU, memory, storage, network, accounts, processes, services, logs, command
   output, leakage and canary categories.
 * No real host data leaks into the emulated shell. Sixteen leakage checks look

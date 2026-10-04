@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import os
 import re
 import secrets
 import struct
@@ -58,10 +59,12 @@ from pathlib import Path
 # copy is how a redaction fix ends up applied in only one place.
 def _locate_shared() -> Path:
     here = Path(__file__).resolve().parent
+    # The last candidate is the installed host's copy (deploy/install.sh
+    # stage 8); HONEYPOT_STATE_DIR overrides the default state directory.
+    _state = Path(os.environ.get("HONEYPOT_STATE_DIR") or "/opt/cowrie")
     for candidate in (here.parent / "shared",
                       here / "shared",
-                      Path("/opt/cowrie/share/pkg/shared"),
-                      Path("/opt/honeypot-monitor/share")):
+                      _state / "share" / "pkg" / "shared"):
         if (candidate / "terminal_safety.py").is_file():
             return candidate
     raise SystemExit(

@@ -10,6 +10,12 @@
 #                                state directory and every captured file.
 #
 # --remove PRINTS WHAT IT WILL DELETE and requires --i-understand-this-destroys-evidence.
+# Before anything is deleted the state directory is checked by
+# deploy/lib/guards.sh: it must look like a honeypot state directory, and it
+# must not be a system directory, a mount point or a symlink. A STATE_DIR that
+# is none of those things is refused; --force-path overrides only that
+# ownership check, never the structural one.
+#
 # Captured files and session recordings are security evidence. Deleting them is
 # irreversible. Export first: ops/quarantine_sync.sh
 # =============================================================================
@@ -18,14 +24,18 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=/dev/null
 source "$REPO_ROOT/deploy/versions.env"
+# shellcheck source=/dev/null
+source "$REPO_ROOT/deploy/lib/guards.sh"
 
 MODE=""
 CONFIRMED=0
+FORCE_PATH=0
 for arg in "$@"; do
     case "$arg" in
         --stop) MODE="stop" ;;
         --remove) MODE="remove" ;;
         --i-understand-this-destroys-evidence) CONFIRMED=1 ;;
+        --force-path) FORCE_PATH=1 ;;
         -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     esac
 done
@@ -93,7 +103,17 @@ rm -f /usr/local/sbin/healthcheck.sh /usr/local/sbin/quarantine_sync.sh \
 rm -f /etc/logrotate.d/cowrie
 
 log "delete the state directory"
-rm -rf "$STATE_DIR"
+# The path is checked before anything is removed, and the check returns the
+# resolved path so the delete acts on what was examined -- not on the raw
+# string that arrived from versions.env or /etc/cowrie-logship.env.
+if ! RESOLVED_STATE_DIR="$(guard_delete_target_state_dir "$STATE_DIR" "$FORCE_PATH")"; then
+    echo
+    echo "Nothing was deleted. The systemd units and helper scripts were already"
+    echo "removed by the steps above; re-run with the path corrected, or pass"
+    echo "--force-path if the refusal is wrong."
+    exit 1
+fi
+rm -rf "$RESOLVED_STATE_DIR"
 
 log "remove the service account"
 if id -u "$HONEYPOT_USER" >/dev/null 2>&1; then
