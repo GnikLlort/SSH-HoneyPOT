@@ -59,10 +59,31 @@ fi
 # -- 2. The honeypot actually speaks SSH --------------------------------------
 # Reading the banner is the only check that distinguishes "listening" from
 # "processing". A wedged reactor accepts connections and then goes silent.
-banner="$(timeout 10 bash -c "exec 3<>/dev/tcp/127.0.0.1/$PORT; head -c 128 <&3" 2>/dev/null || true)"
+#
+# Read ONE LINE, not a fixed byte count. The banner is ~38 bytes and the
+# honeypot then waits for the client's identification string, so a
+# `head -c 128` style read never reaches its count: it blocks until the
+# outer timeout kills it, and its buffered output is lost with it. That made
+# this check report "no banner" - and therefore "reactor wedged" - on a
+# perfectly healthy honeypot, every time. A line-oriented read returns as soon
+# as the CRLF arrives.
+read_banner() {
+    local port="$1" wait="$2" line=""
+    exec 3<>"/dev/tcp/127.0.0.1/$port" 2>/dev/null || return 1
+    if ! IFS= read -r -t "$wait" line <&3; then
+        exec 3<&- 2>/dev/null || true
+        exec 3>&- 2>/dev/null || true
+        return 1
+    fi
+    exec 3<&- 2>/dev/null || true
+    exec 3>&- 2>/dev/null || true
+    printf '%s' "${line%$'\r'}"
+}
+
+banner="$(read_banner "$PORT" 8 2>/dev/null || true)"
 if [[ -z "$banner" ]]; then
     if should_alert ssh_no_banner; then
-        alert ssh_no_banner "port $PORT accepts TCP but sent no SSH banner within 10s (reactor wedged?)"
+        alert ssh_no_banner "port $PORT accepts TCP but sent no SSH banner within 8s (reactor wedged?)"
     fi
     failures=$((failures + 1))
 elif [[ "$banner" != SSH-2.0-* ]]; then

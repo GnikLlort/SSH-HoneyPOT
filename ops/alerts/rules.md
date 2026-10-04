@@ -23,7 +23,7 @@ Design rules used throughout:
 |---|---|---|
 | `isolation_broken` | The `cowrie` account can read `/etc/shadow`, `/root`, or any real user's home | The boundary has failed. Assume the honeypot host is compromised and rebuild. |
 | `service_down` | `cowrie.service` not active for 5 minutes | The honeypot is collecting nothing. |
-| `ssh_no_banner` | Port 22 accepts TCP but sends no SSH banner within 10s | The reactor is wedged. Observed in testing after an unbounded `find /`; the host looks healthy to a port check while recording nothing. |
+| `ssh_no_banner` | Port 22 accepts TCP but sends no SSH banner within 8s | The reactor is wedged. Observed in testing after an unbounded `find /`; the host looks healthy to a port check while recording nothing. |
 | `disk_critical` | Filesystem ≥ 92% full | Captured files are about to stop being written. |
 | `canary_leak` | Any canary value found outside the emulated filesystem | Synthetic content escaped, or real content was copied in. |
 

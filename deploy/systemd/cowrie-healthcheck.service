@@ -8,6 +8,11 @@ Documentation=file:/opt/cowrie/DEPLOYMENT.txt
 Type=oneshot
 User=root
 Environment=TZ=UTC
+# Operator knobs (QUARANTINE_WARN_MB, QUARANTINE_CRITICAL_MB, HONEYPOT_PORT)
+# live in this file; deploy/cowrie-logship.env.example lists healthcheck.sh as
+# one of its readers. Optional (`-`) so a host that has not installed the file
+# yet still runs the check with the defaults from deploy/versions.env.
+EnvironmentFile=-/etc/cowrie-logship.env
 ExecStart=/usr/local/sbin/healthcheck.sh
 # The check is read-only except for the alert state file it maintains.
 Nice=10

@@ -200,3 +200,52 @@ Restating the honest gaps, because a results table implies more than it should:
 * **The destructive scripts were not run.** `uninstall.sh --remove` and
   `rebuild.sh` were syntax-checked, not executed, because executing them
   destroys the evidence these tests depend on.
+
+---
+
+## 7. Re-verification after the packaging fixes
+
+**Run:** 2026-10-04, from a clean checkout on the same build machine. Sections 1
+to 6 above are unchanged; this section records what was re-run and what it found.
+
+Every suite was re-executed against a freshly generated profile and a freshly
+initialised lab (`lab_init`, `127.0.0.1:2222`, Cowrie 3.1.0 at the pinned commit):
+
+| Suite | Result |
+|---|---|
+| `realism/build_profile.py` | exit 0, 6/6 invariants |
+| `tests/test_conformance.py` | **196 / 197**, 0 actionable — the same `info` interop note |
+| `tests/test_playback.py` | **32 / 32** |
+| `tests/test_dashboard.py` | **47 / 47** |
+| `tests/probe_discovery.py` | 84 commands, exit 0; all credential-policy expectations met; no host leakage in the output |
+| `deploy/install.sh` (dry run) | exit 0, all 10 stages printed |
+| `deploy/install.sh --apply` | stages 1, 3, 4, 5, 6, 9, 10 executed in a scratch `STATE_DIR`; see the limitations below |
+| `ops/*.sh` | `canary_scan` clean **and** planted-canary control, `prune_local` refusal paths, `quarantine_sync` missing-bucket guard, `alert_dispatch` local fallback, `healthcheck` against the lab |
+
+### Defects found by the re-verification, and fixed
+
+| # | Where | Was | Now |
+|---|---|---|---|
+| 1 | `deploy/versions.env` | **Missing from every clone, and the cause was `.gitignore`**: the `*.env` rule (meant for secret-bearing files) matched `deploy/versions.env`, so the pin file was silently never committed. `install.sh`, `uninstall.sh`, `rebuild.sh` and `quarantine_sync.sh` all died on their first `source` line, so the documented dry run never printed a plan | `.gitignore` now carries an explicit `!deploy/versions.env` exception (`cowrie-logship.env` stays ignored). The file itself is restored: Cowrie commit pin, PyYAML pin, Python floor, layout and retention defaults. Operational knobs use `${VAR:-default}`, so `/etc/cowrie-logship.env` keeps the documented precedence over the shipped default |
+| 2 | `tests/lib/labctl.sh` | Nothing created `lab/etc/cowrie.cfg`, so the documented `lab_restart` could never start Cowrie; it failed silently after a 20 s wait | `lab_init` builds the lab from `build/profile`; `lab_start` runs it when the lab is missing and prints the captured startup log on failure |
+| 3 | `tests/probe_discovery.py` | Default credentials were Cowrie's stock `phil`/`fout`, which `config/userdb.txt` deliberately denies — the documented sweep could not authenticate | Defaults are the shipped policy; the auth probes record expected vs observed and fail the run on a divergence |
+| 4 | `ops/healthcheck.sh` | The banner check read a fixed byte count (`head -c 128`) from a connection the honeypot keeps open: it blocked for the full 10 s timeout and lost its buffered output, so **every run raised the P1 `ssh_no_banner` alert on a healthy honeypot** and the check could never report healthy | Reads one line with a timeout. Verified against the lab: 0.23 s, no false alert |
+| 5 | `deploy/install.sh` | (a) `--apply --stage N` for N≠4 exited 127 with **no message**, because the installed-version check ran before the virtualenv existed. (b) Stage 3 was not idempotent: a second `--apply` died on `useradd: user 'cowrie' already exists`, contradicting the header's promise of safe re-runs | (a) the check is skipped with a warning when there is no virtualenv to inspect. (b) the account is created only when it does not already exist |
+| 6 | `deploy/systemd/cowrie-healthcheck.service` | Did not load `/etc/cowrie-logship.env`, so the operator knobs documented as reaching `healthcheck.sh` (`QUARANTINE_WARN_MB`, `QUARANTINE_CRITICAL_MB`) never did | `EnvironmentFile=-/etc/cowrie-logship.env` added, optional so a host without the file still runs the check |
+
+None of these change the emulated host: the profile, the credential policy and
+the realism overlay are untouched, and the conformance result is identical
+before and after.
+
+### Limits of this re-verification
+
+* **Stage 2 could not run**: this machine's package mirror has no
+  `python3-dev`, `libffi-dev`, `libssl-dev` or `rsync`. Stage 7 therefore
+  completed every install step except its final `rsync` of the package copy,
+  and stage 8 (systemd units) cannot run without a systemd bus. The stages that
+  did run executed for real against a scratch `STATE_DIR`, not as a dry run.
+* **Still no internet exposure, no load test and no comparison against a real
+  Debian 12.5 host** — the gaps in section 6 stand.
+* **The dashboard has no page in `docs/`.** Its behaviour is covered by
+  `tests/test_dashboard.py` (47 tests) and `AUDIT.md`; the open findings there
+  (F-03 to F-11) are unchanged by this work.

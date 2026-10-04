@@ -18,6 +18,11 @@ lab/
 # Anything that looks like real evidence or real secrets.
 *.env
 !.env.example
+# deploy/versions.env is NOT a secrets file: it is the version-pin file the
+# README, docs/11 and every deploy script treat as tracked. Without this
+# exception the `*.env` pattern above silently excluded it from every clone,
+# which broke install.sh/uninstall.sh/rebuild.sh at their first line.
+!deploy/versions.env
 *.pem
 *.key
 !*/ssh_host_*_key.pub

@@ -161,14 +161,20 @@ stage "Create the dedicated unprivileged service account"
 # The honeypot must never run as root. This account gets no shell, no home
 # directory content, and no sudo. If Cowrie is ever compromised, this is the
 # privilege level the attacker inherits.
-if [[ "$MODE" == "apply" ]]; then
-    if id -u "$HONEYPOT_USER" >/dev/null 2>&1; then
-        note "user $HONEYPOT_USER already exists"
+# Checked in both modes: `useradd` fails hard if the account already exists,
+# and this script advertises itself as safe to re-run. Skipping the creation is
+# the difference between an idempotent re-run and one that dies at stage 3.
+if id -u "$HONEYPOT_USER" >/dev/null 2>&1; then
+    note "user $HONEYPOT_USER already exists; skipping useradd"
+    existing_home="$(getent passwd "$HONEYPOT_USER" | cut -d: -f6)"
+    if [[ -n "$existing_home" && "$existing_home" != "$STATE_DIR" ]]; then
+        warn "its home directory is $existing_home, not $STATE_DIR"
     fi
+else
+    act "create a system account with no login shell and no home directory" \
+        useradd --system --create-home --home-dir "$STATE_DIR" --shell /usr/sbin/nologin \
+                --comment "Cowrie honeypot service account" "$HONEYPOT_USER"
 fi
-act "create a system account with no login shell and no home directory" \
-    useradd --system --create-home --home-dir "$STATE_DIR" --shell /usr/sbin/nologin \
-            --comment "Cowrie honeypot service account" "$HONEYPOT_USER"
 act "create the state directory tree owned by the service account" \
     install -d -o "$HONEYPOT_USER" -g "$HONEYPOT_GROUP" -m 0750 \
         "$STATE_DIR" "$STATE_DIR/etc" "$STATE_DIR/var" "$STATE_DIR/var/log" \
@@ -198,9 +204,19 @@ act "refresh Twisted's plugin cache so twistd can find the cowrie service" \
     "$STATE_DIR/venv/bin/python" "$BUILD_DIR/cowrie/bin/regen-dropin.cache"
 
 if [[ "$MODE" == "apply" ]]; then
-    installed_ver="$("$STATE_DIR/venv/bin/pip" show cowrie 2>/dev/null | awk '/^Version:/{print $2}')"
-    [[ "$installed_ver" == "$COWRIE_VERSION" ]] || die "installed cowrie $installed_ver != pinned $COWRIE_VERSION"
-    note "verified installed version: $installed_ver"
+    # Only checkable once stage 4 has created the virtualenv. On a filtered run
+    # (`--stage 5`) the venv may not exist yet; a bare command substitution here
+    # would make `set -e` kill the script with exit 127 and no message at all,
+    # which is indistinguishable from a crash.
+    if [[ -x "$STATE_DIR/venv/bin/pip" ]]; then
+        installed_ver="$("$STATE_DIR/venv/bin/pip" show cowrie 2>/dev/null | awk '/^Version:/{print $2}')"
+        [[ -n "$installed_ver" ]] || die "cowrie is not installed in $STATE_DIR/venv (re-run stage 4)"
+        [[ "$installed_ver" == "$COWRIE_VERSION" ]] || die "installed cowrie $installed_ver != pinned $COWRIE_VERSION"
+        note "verified installed version: $installed_ver"
+    else
+        warn "no virtualenv at $STATE_DIR/venv; skipping the installed-version check"
+        note "stage 4 (and the full install) creates it. Expected on a filtered run."
+    fi
 fi
 
 # ---------------------------------------------------------------------------
