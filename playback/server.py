@@ -51,6 +51,29 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+# The security-critical primitives live in shared/ so that this viewer and the
+# off-host dashboard cannot drift apart. Find the directory whether this file is
+# run from a repository checkout or from an installed copy under a state
+# directory. A missing shared/ is a hard stop: silently falling back to a local
+# copy is how a redaction fix ends up applied in only one place.
+def _locate_shared() -> Path:
+    here = Path(__file__).resolve().parent
+    for candidate in (here.parent / "shared",
+                      here / "shared",
+                      Path("/opt/cowrie/share/pkg/shared"),
+                      Path("/opt/honeypot-monitor/share")):
+        if (candidate / "terminal_safety.py").is_file():
+            return candidate
+    raise SystemExit(
+        "playback: cannot find shared/terminal_safety.py.\n"
+        "This viewer will not run without the sanitizers it shares with the\n"
+        "dashboard: falling back to a private copy is how a redaction bug gets\n"
+        "fixed in one place and not the other."
+    )
+
+
+sys.path.insert(0, str(_locate_shared()))
+
 # -- Cowrie recording format -------------------------------------------------
 # cowrie/core/ttylog.py
 #   TTYSTRUCT = "<iLiiLL"  -> (op, tty, length, direction, sec, usec)
@@ -78,100 +101,31 @@ MAX_DISPLAY_CHUNK = 64 * 1024
 # =============================================================================
 # Terminal safety
 # =============================================================================
-# Everything below exists so that attacker-supplied bytes cannot affect the
-# reviewer. A recording is untrusted input, exactly like a file uploaded by an
-# attacker: it is displayed, never trusted.
-
-ANSI_RE = re.compile(
-    r"""
-    \x1b\[[0-?]*[ -/]*[@-~]              # CSI: colour, cursor movement, erase
-  | \x1b\][^\x07\x1b]*(?:\x07|\x1b\\)    # OSC: window title, clipboard (OSC 52)
-  | \x1b[PX^_][^\x1b]*(?:\x1b\\)?        # DCS / SOS / PM / APC strings
-  | \x1b[@-Z\\-_]                         # two-byte escapes
-  | \x9b[0-?]*[ -/]*[@-~]                # 8-bit CSI
-  | \x1b.                                  # anything else beginning with ESC
-    """,
-    re.VERBOSE,
+# The sanitizers now live in shared/terminal_safety.py so that this on-host
+# viewer and the off-host monitoring dashboard cannot drift apart: a redaction
+# fix made in one place must apply to both. They are re-exported here under the
+# names the tests and the renderer use.
+from terminal_safety import (  # noqa: E402,F401
+    REDACTED,
+    mask_sensitive,
+    safe_html,
+    safe_text,
+    strip_escapes,
+    strip_terminal_control,
 )
-# Control characters that can drive a terminal or a browser. Newline and tab are
-# handled separately; carriage return becomes a line break at render time.
-CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-# Bidirectional overrides can reorder displayed text to disguise what a command
-# actually said ("rm -rf /" rendered as something harmless).
-BIDI_RE = re.compile("[\u202a-\u202e\u2066-\u2069\ufeff]")
-
-SENSITIVE_PATTERNS: list[re.Pattern[str]] = [
-    # Cowrie logs the credential it accepted; that is the visitor's password and
-    # must not be on screen by default.
-    re.compile(r"(?i)(\b(?:password|passwd|pwd|passphrase)\b\s*[:=]\s*)(\S+)"),
-    re.compile(r"(?i)(\b(?:mysqldump|mysql)\b[^\n]*?\s-p)(\S+)"),
-    re.compile(r"(?i)(-pass(?:in|out)?\s+)(\S+)"),
-    re.compile(r"(?i)(\bcurl\b[^\n]*?\s-u\s+)(\S+)"),
-    re.compile(r"(?i)(\bwget\b[^\n]*?--(?:user|password)=)(\S+)"),
-    re.compile(r"(ssh-(?:rsa|ed25519|dss)\s+)(AAAA[A-Za-z0-9+/=]{16,})"),
-    re.compile(r"(?i)(\b(?:authorization|bearer)\b\s*:?\s*)([A-Za-z0-9._\-]{16,})"),
-    re.compile(r"\b((?:AKIA|ASIA))([0-9A-Z]{16})\b"),
-    re.compile(r"(-----BEGIN [A-Z ]*PRIVATE KEY-----)"),
-]
-
-REDACTED = "[REDACTED]"
-
-
-def strip_escapes(raw: str) -> str:
-    """
-    Remove escape sequences and bidirectional overrides, but KEEP the
-    line-editing control characters (backspace, Ctrl-C, Ctrl-U).
-
-    Two stages matter. The transcript needs the editing characters to know what
-    the visitor deleted or aborted; display needs them gone. Stripping
-    everything in one pass silently breaks both: a corrected command looks like
-    one long command, and an aborted one merges into the next.
-    """
-    text = ANSI_RE.sub("", raw)
-    return BIDI_RE.sub("", text)
-
-
-def strip_terminal_control(raw: str) -> str:
-    """Remove escape sequences and all remaining control characters."""
-    return CONTROL_RE.sub("", strip_escapes(raw))
-
-
-def mask_sensitive(text: str) -> str:
-    """
-    Redact captured secrets for display.
-
-    Applied to the displayed copy only; the recording on disk is never
-    modified.
-    """
-    for pattern in SENSITIVE_PATTERNS:
-        text = pattern.sub(lambda m: m.group(1) + REDACTED if m.lastindex else REDACTED, text)
-    return text
-
-
-def safe_text(raw: str, mask: bool = True) -> str:
-    """
-    Turn recorded bytes into something safe to display.
-
-    Order matters: strip terminal control first, then mask secrets. Reversing it
-    would let an escape sequence split a secret so the masker missed it.
-    """
-    if len(raw) > MAX_DISPLAY_CHUNK:
-        raw = raw[:MAX_DISPLAY_CHUNK] + "\n[truncated by the viewer]"
-    text = strip_terminal_control(raw)
-    if mask:
-        text = mask_sensitive(text)
-    return text
-
 
 # =============================================================================
 # Artefact loading
 # =============================================================================
-@dataclass
-class Chunk:
-    """One timed piece of terminal traffic."""
-    offset_ms: int
-    direction: str      # "in" (visitor typed) or "out" (host replied)
-    text: str
+# Chunk, the ttylog parser and the transcript deriver come from shared/ so the
+# dashboard decodes a recording identically. Note Chunk.direction is one of
+# "in" / "out" / "cmd" -- "cmd" is an exec-channel command delivered whole.
+from ttylog import (  # noqa: E402
+    Chunk,
+    derive_transcript,
+    parse_ttylog_bytes,
+    parse_ts_epoch as _parse_ts_epoch_shared,
+)
 
 
 @dataclass
@@ -390,46 +344,22 @@ class EvidenceStore:
 
     @staticmethod
     def _read_ttylog(path: Path) -> list[Chunk]:
-        """Parse a Cowrie ttylog into timed chunks."""
-        chunks: list[Chunk] = []
+        """
+        Parse a Cowrie ttylog into timed chunks.
+
+        Delegates to shared/ttylog.py so the dashboard decodes the same file the
+        same way. Tolerant of a truncated final record, which a hard kill
+        leaves behind and which is still worth reviewing.
+        """
         try:
             if path.stat().st_size > MAX_RECORDING_BYTES:
                 return [Chunk(0, "out",
-                              f"[recording exceeds the {MAX_RECORDING_BYTES // (1024 * 1024)} MB viewer limit]")]
+                              f"[recording exceeds the {MAX_RECORDING_BYTES // (1024 * 1024)} MB "
+                              f"viewer limit]")]
             data = path.read_bytes()
         except OSError:
             return []
-
-        first_ts: float | None = None
-        pos = 0
-        while pos + TTYSTRUCT_SIZE <= len(data):
-            try:
-                op, _tty, length, direction, sec, usec = struct.unpack(
-                    TTYSTRUCT, data[pos:pos + TTYSTRUCT_SIZE]
-                )
-            except struct.error:
-                break
-            pos += TTYSTRUCT_SIZE
-            ts = sec + usec / 1_000_000.0
-            if first_ts is None:
-                first_ts = ts
-            if length < 0 or pos + length > len(data):
-                break
-            payload = data[pos:pos + length]
-            pos += length
-            if op != OP_WRITE_OP:
-                continue
-            kind = DIRECTION_BY_TYPE.get(direction)
-            if kind is None:
-                continue
-            chunks.append(
-                Chunk(
-                    offset_ms=int((ts - first_ts) * 1000),
-                    direction=kind,
-                    text=payload.decode("utf-8", "replace"),
-                )
-            )
-        return chunks
+        return parse_ttylog_bytes(data)
 
     # -- accessors ---------------------------------------------------------
     def sessions(self) -> list[Session]:
@@ -444,45 +374,12 @@ class EvidenceStore:
         """
         Derive a command transcript from the recording.
 
-        This is a reconstruction of what the terminal echoed back, not a record
-        of executed commands: Cowrie's own `cowrie.command.input` events in
-        cowrie.json are authoritative for that. Both views are offered so a
-        reviewer can compare them.
+        Delegates to shared/ttylog.py. This is a reconstruction of what the
+        terminal carried, not a record of what executed: Cowrie's own
+        `cowrie.command.input` events in cowrie.json are authoritative. Both
+        views are offered so a reviewer can compare them.
         """
-        out: list[dict] = []
-        buffer = ""
-        offset = 0
-        for chunk in s.chunks:
-            # Strip escape sequences BEFORE assembling lines, but keep the
-            # line-editing characters. Doing this after assembly would leave
-            # the *parameters* of a sequence behind as literal text - "\x1b[2J"
-            # would become "[2J" in the transcript - which both looks like a
-            # command the visitor never typed and would let an attacker write
-            # plausible text into the transcript using a cursor or erase
-            # sequence.
-            text = strip_escapes(chunk.text)
-            if chunk.direction == "cmd":
-                # Exec channel: the command arrived as one complete record.
-                out.append(self._emit(buffer, offset, mask))   # flush any partial line
-                buffer = ""
-                offset = chunk.offset_ms
-                out.append(self._emit(text, chunk.offset_ms, mask))
-                continue
-            if chunk.direction != "in":
-                continue
-            offset = chunk.offset_ms
-            for ch in text:
-                if ch in ("\r", "\n"):
-                    out.append(self._emit(buffer, offset, mask))
-                    buffer = ""
-                elif ch in ("\x7f", "\b"):
-                    buffer = buffer[:-1]
-                elif ch in ("\x03", "\x15", "\x04"):   # Ctrl-C, Ctrl-U, Ctrl-D
-                    buffer = ""
-                elif ord(ch) >= 32:
-                    buffer += ch
-        out.append(self._emit(buffer, offset, mask))
-        return [row for row in out if row["command"]]
+        return derive_transcript(s.chunks, mask=mask)
 
     @staticmethod
     def _emit(buffer: str, offset: int, mask: bool) -> dict:
