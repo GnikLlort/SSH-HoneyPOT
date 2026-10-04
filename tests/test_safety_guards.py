@@ -332,5 +332,132 @@ class TestIsolationConfig(unittest.TestCase):
         self.assertTrue(isolation_config_problems(cfg))
 
 
+class TestSharedLibraryResolution(unittest.TestCase):
+    """
+    Every module that needs shared/ must be able to find it in both places it
+    exists: beside the package (a checkout, and the installed copy -- both have
+    shared/ one level up from dashboard/) and under the state directory that
+    deploy/install.sh populates.
+
+    The second fallback used to read /opt/honeypot-monitor/share, which no
+    installer or document in this repository has ever created, so it had never
+    resolved. These tests keep a real path there and keep the phantom out.
+    """
+
+    REPO = Path(__file__).resolve().parent.parent
+
+    def test_no_module_references_a_path_the_installer_never_creates(self) -> None:
+        offenders = []
+        for path in sorted(self.REPO.rglob("*")):
+            rel = path.relative_to(self.REPO)
+            if path.suffix not in (".py", ".sh") or path.is_dir():
+                continue
+            if rel.parts[0] in (".git", "lab", "build", "tests"):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if "/opt/honeypot-monitor" in text:
+                offenders.append(str(rel))
+        self.assertEqual(offenders, [],
+                         "these ship a shared/ fallback path that nothing creates: "
+                         + ", ".join(offenders))
+
+    def test_the_state_directory_fallback_resolves_shared(self) -> None:
+        """
+        Run the dashboard modules from a copy that has no sibling shared/, with
+        HONEYPOT_STATE_DIR pointing at a host layout that does. If the fallback
+        is real, they import; if it is a phantom, they die with an ImportError.
+        """
+        tmp = Path(tempfile.mkdtemp(prefix="shared-resolution-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+
+        partial = tmp / "partial"
+        (partial / "dashboard").parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(self.REPO / "dashboard", partial / "dashboard",
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+
+        host = tmp / "host"
+        shared_dst = host / "share" / "pkg" / "shared"
+        shared_dst.mkdir(parents=True)
+        for src in sorted((self.REPO / "shared").glob("*.py")):
+            shutil.copy2(src, shared_dst / src.name)
+
+        env = dict(os.environ, HONEYPOT_STATE_DIR=str(host), PYTHONDONTWRITEBYTECODE="1")
+        proc = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, %r)\n"
+             "import store, auth, render, bundle\n"
+             "import safe_paths, terminal_safety\n"
+             "print(safe_paths.__file__); print(terminal_safety.__file__)\n"
+             % str(partial / "dashboard")],
+            capture_output=True, text=True, env=env, timeout=120,
+            cwd=str(tmp))
+        self.assertEqual(proc.returncode, 0,
+                         "the modules could not find shared/ via "
+                         "HONEYPOT_STATE_DIR:\n" + proc.stderr[-2000:])
+        self.assertIn(str(shared_dst), proc.stdout,
+                      "shared/ was not loaded from the state directory")
+
+    def test_a_checkout_without_shared_fails_loudly(self) -> None:
+        """Negative control: with neither candidate present, the failure is
+        explicit rather than a silent fallback to stale code."""
+        tmp = Path(tempfile.mkdtemp(prefix="no-shared-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        (tmp / "dashboard").parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(self.REPO / "dashboard", tmp / "dashboard",
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        env = dict(os.environ, HONEYPOT_STATE_DIR=str(tmp / "empty"),
+                   PYTHONDONTWRITEBYTECODE="1")
+        proc = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, %r)\nimport store\n"
+             % str(tmp / "dashboard")],
+            capture_output=True, text=True, env=env, timeout=120, cwd=str(tmp))
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("No module named", proc.stderr)
+
+
+class TestShippedScriptModes(unittest.TestCase):
+    """
+    A script the documentation tells a user to run must be runnable.
+
+    docs/03-install-ubuntu-ec2.md says `sudo ./deploy/install.sh --apply`.
+    install.sh was committed 0644 while every other shipped script was 0755, so
+    that exact command failed with "permission denied" on a fresh clone. The
+    shell scripts under a lib/ directory are sourced, not executed, and are
+    allowed to be non-executable.
+    """
+
+    REPO = Path(__file__).resolve().parent.parent
+
+    def test_executable_scripts_have_the_executable_bit(self) -> None:
+        offenders = []
+        for path in sorted(self.REPO.rglob("*.sh")):
+            rel = path.relative_to(self.REPO)
+            if rel.parts[0] in (".git", ".venv", "build", "lab"):
+                continue
+            if "lib" in rel.parts[:-1]:
+                continue  # sourced, never executed
+            try:
+                first = path.open("r", encoding="utf-8", errors="replace").readline()
+            except OSError:
+                continue
+            if not first.startswith("#!"):
+                continue  # not a directly runnable script
+            if not os.access(path, os.X_OK):
+                offenders.append(str(rel))
+        self.assertEqual(offenders, [],
+                         "these are executed directly but are not executable: "
+                         + ", ".join(offenders))
+
+    def test_the_documented_install_command_is_runnable(self) -> None:
+        """Negative control tied to the exact invocation in the docs."""
+        install = self.REPO / "deploy" / "install.sh"
+        self.assertTrue(os.access(install, os.X_OK),
+                        "docs/03 tells the reader to run `sudo ./deploy/install.sh`")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

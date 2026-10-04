@@ -57,7 +57,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
-for _cand in (_HERE.parent / "shared", Path("/opt/honeypot-monitor/share")):
+# shared/ sits beside the package in a checkout and under
+# $STATE_DIR/share/pkg/ in an installed host (deploy/install.sh stage 8).
+_state = Path(os.environ.get("HONEYPOT_STATE_DIR") or "/opt/cowrie")
+for _cand in (_HERE.parent / "shared", _state / "share" / "pkg" / "shared"):
     if (_cand / "terminal_safety.py").is_file():
         sys.path.insert(0, str(_cand))
         break
@@ -202,6 +205,26 @@ CREATE TABLE IF NOT EXISTS recording (
     duration_ms  INTEGER NOT NULL DEFAULT 0,
     ingested     TEXT NOT NULL
 );
+
+-- A session can have MORE THAN ONE recording, and this table is why.
+-- Cowrie starts a ttylog per shell, not per connection: a client that opens
+-- several exec channels on one SSH connection (ssh -M, paramiko, most scripted
+-- toolkits) produces several `cowrie.log.closed` events for one session, each
+-- naming a different shasum. The session.recording_sha256 column holds only
+-- one of them, so before this table the others were stored but unreachable --
+-- an investigator saw one of eight transcripts and no indication that the rest
+-- existed. This is the link that makes all of them addressable, in order.
+CREATE TABLE IF NOT EXISTS session_recording (
+    sensor     TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    sha256     TEXT NOT NULL,
+    ordinal    INTEGER NOT NULL DEFAULT 0,
+    bytes      INTEGER NOT NULL DEFAULT 0,
+    duplicate  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (sensor, session_id, sha256)
+);
+CREATE INDEX IF NOT EXISTS idx_sessrec_session
+    ON session_recording(sensor, session_id, ordinal);
 
 CREATE TABLE IF NOT EXISTS command (
     id         INTEGER PRIMARY KEY,
@@ -569,7 +592,7 @@ class Store:
             "ended": None, "duration_ms": 0, "username": None, "login_result": "unknown",
             "client_version": None, "recording_sha256": None, "recording_bytes": 0,
             "recording_duplicate": 0, "command_count": 0, "transfer_count": 0,
-            "chunk_count": 0,
+            "chunk_count": 0, "recordings": [],
         })
         eid = str(ev.get("eventid", ""))
         ts = str(ev.get("timestamp", ""))
@@ -595,15 +618,35 @@ class Store:
             except (TypeError, ValueError):
                 pass
         elif eid == "cowrie.log.closed":
-            # Authoritative recording pointer. `shasum` is the SHA-256 of the
-            # visitor's input; `duplicate` means Cowrie deleted this session's
-            # file because an identical recording already existed.
-            s["recording_sha256"] = ev.get("shasum") or s["recording_sha256"]
-            s["recording_duplicate"] = 1 if ev.get("duplicate") else 0
+            # One event per shell, not per connection, so a session can name
+            # several recordings. Collect them all; the single-valued column
+            # below is kept for the queries and pages that want "the" recording
+            # and for stores written before session_recording existed.
+            #
+            # `shasum` is the SHA-256 of the visitor's input; `duplicate` means
+            # Cowrie did not write a new file because an identical recording
+            # already existed under an earlier session's name.
+            sha = ev.get("shasum") or ""
             try:
-                s["recording_bytes"] = int(ev.get("size") or 0)
+                size = int(ev.get("size") or 0)
             except (TypeError, ValueError):
-                pass
+                size = 0
+            if sha:
+                s["recordings"].append({"sha256": sha, "bytes": size,
+                                        "duplicate": 1 if ev.get("duplicate") else 0})
+                # Primary: the first recording that actually exists as a file.
+                # A duplicate has no file of its own, so preferring a
+                # non-duplicate is what makes the session page open something.
+                if not s["recording_sha256"] or (
+                        s["recording_duplicate"] and not ev.get("duplicate")):
+                    s["recording_sha256"] = sha
+                    s["recording_bytes"] = size
+                    s["recording_duplicate"] = 1 if ev.get("duplicate") else 0
+            if not s["duration_ms"]:
+                try:
+                    s["duration_ms"] = int(ev.get("duration_ms") or 0)
+                except (TypeError, ValueError):
+                    pass
             if not s["duration_ms"]:
                 try:
                     s["duration_ms"] = int(ev.get("duration_ms") or 0)
@@ -613,6 +656,38 @@ class Store:
             s["command_count"] += 1
         elif eid in TRANSFER_EVENTS:
             s["transfer_count"] += 1
+
+    @staticmethod
+    def _link_session_recordings(conn: sqlite3.Connection, sensor: str, sid: str,
+                                 s: dict) -> None:
+        """
+        Record every ttylog this session named, in order.
+
+        Uses the caller's connection, deliberately. Opening a second one here
+        would take a write lock while the session upsert still holds its own,
+        and SQLite would block until the timeout -- a deadlock that looks like a
+        hang in the ingest timer.
+
+        INSERT ... ON CONFLICT rather than delete-then-insert: bundles overlap,
+        and an events-only bundle arriving later must not clear links that a
+        recordings-bearing bundle established. The primary key is the
+        (session, sha) pair, so re-ingesting the same bundle is a no-op.
+        """
+        rows = s.get("recordings") or []
+        if not rows:
+            return
+        for ordinal, rec in enumerate(rows):
+            conn.execute(
+                """INSERT INTO session_recording(sensor, session_id, sha256,
+                       ordinal, bytes, duplicate)
+                   VALUES(?,?,?,?,?,?)
+                   ON CONFLICT(sensor, session_id, sha256) DO UPDATE SET
+                       ordinal = excluded.ordinal,
+                       bytes   = MAX(session_recording.bytes, excluded.bytes),
+                       duplicate = MIN(session_recording.duplicate, excluded.duplicate)""",
+                (sensor, sid, rec["sha256"], ordinal, rec["bytes"],
+                 1 if rec.get("duplicate") else 0),
+            )
 
     def _upsert_session(self, conn: sqlite3.Connection, sensor: str, sid: str, s: dict) -> None:
         conn.execute(
@@ -669,6 +744,7 @@ class Store:
                 )
             except sqlite3.IntegrityError:
                 pass
+        self._link_session_recordings(conn, sensor, sid, s)
 
     def _link_recording(self, sensor: str, sid: str, s: dict) -> None:
         sha = s.get("recording_sha256")
@@ -698,6 +774,67 @@ class Store:
                 (len(chunks), sensor, sid),
             )
 
+    def _migrate_recording_links(self) -> int:
+        """
+        Give a pre-existing store its recording links, without a re-ingest.
+
+        A store written before `session_recording` existed kept only one
+        recording per session, but the `cowrie.log.closed` events that name the
+        others were stored all along in the event table. So the links are
+        rebuilt from those events, in timestamp order, which recovers the
+        recordings the old single-valued column lost -- no re-export, no
+        re-ingest, nothing read from disk.
+
+        `duplicate` is read out of the stored raw JSON rather than the table
+        (there is no column for it), guarded so a truncated or unparsable line
+        cannot fail the migration. Returns the number of sessions migrated.
+        """
+        migrated = 0
+        with self.connect() as conn:
+            sessions = conn.execute(
+                """SELECT DISTINCT e.sensor, e.session_id
+                     FROM event e
+                    WHERE e.eventid = 'cowrie.log.closed'
+                      AND e.shasum IS NOT NULL AND e.shasum != ''
+                      AND NOT EXISTS (SELECT 1 FROM session_recording r
+                                       WHERE r.sensor = e.sensor
+                                         AND r.session_id = e.session_id)"""
+            ).fetchall()
+            for sess in sessions:
+                rows = conn.execute(
+                    """SELECT shasum, size, raw FROM event
+                        WHERE sensor=? AND session_id=?
+                          AND eventid='cowrie.log.closed'
+                          AND shasum IS NOT NULL AND shasum != ''
+                        ORDER BY ts_epoch ASC, id ASC""",
+                    (sess["sensor"], sess["session_id"])).fetchall()
+                for ordinal, row in enumerate(rows):
+                    duplicate = 0
+                    try:
+                        duplicate = 1 if json.loads(row["raw"] or "{}").get("duplicate") else 0
+                    except (ValueError, TypeError):
+                        duplicate = 0
+                    conn.execute(
+                        """INSERT OR IGNORE INTO session_recording(sensor, session_id,
+                               sha256, ordinal, bytes, duplicate)
+                           VALUES(?,?,?,?,?,?)""",
+                        (sess["sensor"], sess["session_id"], row["shasum"], ordinal,
+                         int(row["size"] or 0), duplicate))
+                migrated += 1
+            # Sessions with no log.closed event left in the store (pruned, or an
+            # events-only bundle): fall back to the single value they name.
+            conn.execute(
+                """INSERT OR IGNORE INTO session_recording(sensor, session_id,
+                       sha256, ordinal, bytes, duplicate)
+                   SELECT sensor, session_id, recording_sha256, 0, recording_bytes,
+                          recording_duplicate
+                     FROM session
+                    WHERE recording_sha256 IS NOT NULL AND recording_sha256 != ''
+                      AND NOT EXISTS (SELECT 1 FROM session_recording r
+                                       WHERE r.sensor = session.sensor
+                                         AND r.session_id = session.session_id)""")
+        return migrated
+
     def _backfill_recording_links(self) -> int:
         """
         Attach recordings to sessions that name one but have no chunk count yet.
@@ -707,6 +844,7 @@ class Store:
         recordings-only bundle ends up in the same state as a bundle containing
         both.
         """
+        self._migrate_recording_links()
         linked = 0
         with self.connect() as conn:
             rows = conn.execute(
@@ -1224,7 +1362,11 @@ class Queries:
         with self._conn() as conn:
             total = conn.execute(f"SELECT COUNT(*) FROM session{where}", args).fetchone()[0]
             rows = conn.execute(
-                f"""SELECT * FROM session{where}
+                f"""SELECT session.*,
+                           (SELECT COUNT(*) FROM session_recording r
+                             WHERE r.sensor = session.sensor
+                               AND r.session_id = session.session_id) AS recording_count
+                    FROM session{where}
                     ORDER BY COALESCE(started_epoch,0) DESC LIMIT ? OFFSET ?""",
                 [*args, limit, int(f.offset or 0)],
             ).fetchall()
@@ -1255,6 +1397,36 @@ class Queries:
         return [dict(r) for r in rows]
 
     # -- recordings --------------------------------------------------------
+    def session_recordings(self, sensor: str, session_id: str) -> list[dict]:
+        """
+        Every recording this session named, in the order Cowrie closed them.
+
+        Falls back to the single-valued session column when the link table is
+        empty for the session -- a store ingested before this table existed
+        still has that column populated, and the page must not go blank.
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT r.sha256, r.ordinal, r.bytes, r.duplicate,
+                          rec.chunk_count, rec.duration_ms
+                     FROM session_recording r
+                     LEFT JOIN recording rec ON rec.sha256 = r.sha256
+                    WHERE r.sensor=? AND r.session_id=?
+                    ORDER BY r.ordinal ASC, r.sha256 ASC""",
+                (sensor, session_id)).fetchall()
+            if rows:
+                return [dict(r) for r in rows]
+            legacy = conn.execute(
+                "SELECT recording_sha256, recording_bytes, recording_duplicate "
+                "FROM session WHERE sensor=? AND session_id=?",
+                (sensor, session_id)).fetchone()
+        if not legacy or not legacy["recording_sha256"]:
+            return []
+        return [{"sha256": legacy["recording_sha256"], "ordinal": 0,
+                 "bytes": legacy["recording_bytes"],
+                 "duplicate": legacy["recording_duplicate"],
+                 "chunk_count": None, "duration_ms": None}]
+
     def recording_path(self, sha256: str) -> Path | None:
         """
         Resolve a recording to a path inside the store.

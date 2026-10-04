@@ -25,6 +25,9 @@ each claim of "verified correct" was tested or traced into the Cowrie source.
 | F-09 | Low | Dead code implying controls that never run | **Fixed** |
 | F-10 | Low | A rejected request body is not drained | **Fixed** |
 | F-11 | Info | `safe_html` does not escape backticks | **Fixed** |
+| F-12 | Medium | A session with several recordings showed only one of them | **Fixed** |
+| F-13 | Info | The `shared/` fallback path was one nothing creates | **Fixed** |
+| F-14 | Low | `deploy/install.sh` was not executable | **Fixed** |
 
 Two findings are high severity. Both were found by executing the code against
 hostile input, not by reading it. One of them (F-02) was introduced by this
@@ -490,6 +493,174 @@ one asserting no raw backtick survives.
 
 ---
 
+### F-12 — A session with several recordings shows only one of them — MEDIUM — FIXED
+
+**Found by:** running the dashboard against a real Cowrie instance instead of
+the test fixture. Every other finding in this document came from reading or
+probing the code; this one came from asking the running interface a question
+about real traffic, and no unit test would have produced it — the fixture
+contains one recording per session by construction.
+
+**What happens.** Cowrie starts a ttylog **per shell, not per connection**. A
+client that opens more than one channel on a single SSH connection — `ssh -M`,
+paramiko, most scripted toolkits, and this package's own conformance client —
+produces one `cowrie.log.closed` event per command, each naming a different
+`shasum`. Ingesting one real session from the lab:
+
+```
+session a7313c5ce926   commands=8
+  cowrie.log.closed -> a56145270ce6...  54 B
+  cowrie.log.closed -> 28ba533b0f3c... 100 B
+  cowrie.log.closed -> 7063dece7ccc...  10 B
+  cowrie.log.closed -> 37454cf870d1... 313 B
+  cowrie.log.closed -> 4295cb060cfb... 388 B
+  cowrie.log.closed -> 0a152b363586... 117 B
+  cowrie.log.closed -> 798339512a50... 378 B
+  cowrie.log.closed -> f25297859cf0...   7 B
+```
+
+`session.recording_sha256` is a single column and `_accumulate_session` assigned
+it per event, so the last one won. The session page displayed that one hash and
+the playback API rendered that one transcript. The other seven **were copied
+into the store and indexed in `recording`** — nothing was lost — but no page,
+link or query could reach them, and nothing said that the transcript on screen
+was a fraction of the session. A reviewer reading the `whoami` transcript of an
+eight-command session would reasonably conclude the session ran one command.
+
+**Measured on real traffic.** The defect scales with how a client behaves:
+ingesting the lab after its own conformance run produced a session with **64
+recordings** (one per command from the multiplexed test client). The dashboard
+showed one.
+
+**Impact.** Not data loss and not corruption: every recording is in the store,
+and the authoritative record — `cowrie.json`, with every `log.closed` event and
+its shasum — is intact and complete. The impact is on review: an investigator
+can be shown a small fraction of a session, without being told, which is the
+kind of quiet incompleteness this tool exists to prevent.
+
+**Fix applied.** Three parts:
+
+1. **Schema.** A new `session_recording(sensor, session_id, sha256, ordinal,
+   bytes, duplicate)` table holds every recording a session named, in the order
+   Cowrie closed them. `INSERT ... ON CONFLICT`, so an overlapping or
+   events-only bundle never clears links that a recordings-bearing bundle
+   established, and re-ingesting is a no-op.
+2. **Migration.** A store written before that table existed is repaired without
+   re-export or re-ingest: the `cowrie.log.closed` events were stored all along
+   in the event table, so the links are rebuilt from those, in timestamp order.
+   Verified against the live store above — 8 links recovered. A store whose
+   events were pruned falls back to the single value it names.
+3. **Interface.** The session page lists every recording with its size, chunk
+   count and duplicate/missing state, and renders the selected one; `?sha=`
+   selects explicitly. A hash that is not one of the session's recordings is
+   **refused** (404) rather than silently substituted — serving recording 3 when
+   7 was asked for is how a review reaches the wrong conclusion. The sessions
+   list and the CSV/JSON exports carry `recording_count`.
+
+**One behaviour this changes:** the single-valued column is now the first
+recording that actually exists as a file, rather than the last one announced. A
+duplicate has no file of its own, so preferring a non-duplicate is what makes
+the default page open something.
+
+Tests: `TestMultipleRecordings` (5), from a fixture of one session with three
+recordings.
+
+**Not done, deliberately:** the recordings are not merged into one continuous
+transcript. Their offsets are not comparable — each ttylog starts at zero for
+its own shell — so a merged timeline would look authoritative and be wrong.
+Listing them, in order, each with its own clock, is the honest presentation;
+anything better needs shell/channel metadata that Cowrie does not write into the
+ttylog.
+
+---
+
+### F-13 — The `shared/` fallback path was one nothing creates — INFO — FIXED
+
+**Found by:** packaging verification for F-03 and F-12 — installing the tree the
+way `deploy/install.sh` does and running it from there.
+
+**What happens.** Six modules (`dashboard/auth.py`, `bundle.py`, `render.py`,
+`server.py`, `store.py`, `playback/server.py`) import from `shared/` and, when
+they cannot find it beside themselves, fell back to
+`/opt/honeypot-monitor/share`. **Nothing in this repository creates that path.**
+The installer copies the package to `$STATE_DIR/share/pkg` (`STATE_DIR` defaults
+to `/opt/cowrie`, and is overridable in `deploy/versions.env`), so the fallback
+had never resolved once — in a checkout, in an installed host, or anywhere else.
+`playback/server.py` already listed the correct location in its candidate list;
+the six dashboard modules did not.
+
+**Impact.** Presently none: the first candidate (`shared/` one level above the
+module) resolves in a checkout and in the installed copy, so the dashboard runs.
+The cost is to the reader: a path that appears six times and is created by
+nothing is exactly the kind of misleading code a reviewer learns to distrust,
+and if the package were ever split — `dashboard/` copied alone onto a host whose
+`shared/` lives under the state directory — the failure would be an
+`ImportError` from a module whose own fallback pointed somewhere no installer
+had ever looked. Severity Info: no misbehaviour today.
+
+**Fix applied.** Both fallbacks are real paths now: the installed location is
+derived from `HONEYPOT_STATE_DIR` (default `/opt/cowrie`), matching what
+`playback/server.py` and the installer already used. Verified by running the
+modules from a copy that has no sibling `shared/` and pointing
+`HONEYPOT_STATE_DIR` at a host layout: they resolve it. With neither candidate
+present they fail loudly rather than importing a stale copy.
+
+Tests: `TestSharedLibraryResolution` (3), including a scan that fails if any
+shipped module names the phantom path again.
+
+**Also verified for the packaging question this came from.** The `rsync` at
+install stage 8 copies the whole tree with `.git`, `.venv`, `build`, `lab` and
+bytecode excluded, so the files F-03 and F-12 added — `shared/safe_paths.py`,
+`shared/ttylog.py`, `deploy/lib/guards.sh`, `dashboard/*.py` — are all in the
+installed copy; a tar-reproduced `$STATE_DIR/share/pkg` imports every dashboard
+module, resolves `shared/` in place, and builds a bundle from the real lab
+state (451 events, 66 recordings, 1 capture).
+
+---
+
+### F-14 — `deploy/install.sh` was not executable — LOW — FIXED
+
+**Found by:** following the installation document to the letter while checking
+the packaging claims.
+
+**What happens.** `deploy/install.sh` is committed `0644`, while every other
+shipped script — `deploy/rebuild.sh`, `deploy/uninstall.sh`, all of `ops/*.sh`,
+the test lab helper — is `0755`. `docs/03-install-ubuntu-ec2.md` tells the
+reader to run:
+
+```
+sudo ./deploy/install.sh --apply
+```
+
+On a fresh clone that fails with `permission denied` (exit 126) before any of
+its checks run. The script's own header says `./install.sh` as well. Running it
+as `bash deploy/install.sh` works, which is how it was exercised in the earlier
+passes — so the defect never surfaced there, and that is exactly why the audit
+records it: the documented command and the tested command were not the same
+command.
+
+**Impact.** No unsafe state, no data loss; the install cannot start the way the
+documentation says to start it, and the natural reading of the failure is "this
+package is broken" or "I need to chmod it", which trains an operator to loosen
+permissions on a file whose permissions are part of the story. The `--dry-run`
+default means the blast radius of the mistake is a confusing error rather than a
+partial install.
+
+**Fix applied.** `chmod +x deploy/install.sh`, verified by running the documented
+command: `./deploy/install.sh --dry-run` now prints the plan and exits 0.
+
+**Why the mode, and not the docs.** Either would work, but the script is a
+top-level operator entry point with a `#!` line and it was the only such file in
+the repository that was not executable — the exception was the defect, so the
+exception is what changed. `deploy/lib/guards.sh` stays `0644` on purpose: it is
+sourced by other scripts, never executed, and the new test exempts `lib/`.
+
+Tests: `TestShippedScriptModes` (2) — every shebang-bearing script outside a
+`lib/` directory must have the executable bit, plus a check tied to the exact
+command in the docs.
+
+---
+
 ## 3. What was verified as correct
 
 These were tested or traced to a source of truth. They are the claims the design
@@ -587,19 +758,20 @@ describes provides false assurance, so this was checked rather than assumed.
 
 ### Added by the follow-up pass
 
-`tests/test_dashboard.py` — 47 before, **76 after**; all passing.
+`tests/test_dashboard.py` — 47 before, **81 after**; all passing.
 
 | Test | Guards |
 |------|--------|
 | `TestFilterValidation` (6) | F-06: bad bounds raise on every query path, a future bound returns 0 rows, `%`/`_`/`\` are literal characters, ordinary search still works |
 | `TestPlaybackBounds` (6) | F-04: an oversized recording is described and **never opened** (asserted by patching `read_bytes`), slot exhaustion is reported, a parse failure releases the slot |
 | `TestSessionHousekeeping` (4) | F-09: expired rows are purged and do not accumulate, login purges, a session is bound to its User-Agent, a missing UA does not lock a session out |
+| `TestMultipleRecordings` (5) | F-12: every recording of a multi-shell session is linked, ordered and renderable; an unknown hash is refused rather than substituted |
 | `TestManageUnlockCli` (2) | F-05: the CLI clears a lock without touching the password, records `user.unlock`, and reports an unknown account |
 | `TestLoginCsrf` (7) | F-07: token bound to a cookie, missing/mismatched/old-constant tokens refused with no session issued, a correct token signs in; F-06's 400 over HTTP; F-10's connection close |
 | `TestRelaxedControls` (3) | F-08: every relaxed control is listed, nothing is listed when nothing is relaxed, demo mode on a reachable interface is named |
 | `TestHtmlEscaping` (2) | F-11: no raw backtick survives, ordinary escaping still correct |
 
-`tests/test_safety_guards.py` — **new, 26 tests**; all passing.
+`tests/test_safety_guards.py` — **new, 31 tests**; all passing.
 
 | Test | Guards |
 |------|--------|
@@ -608,6 +780,8 @@ describes provides false assurance, so this was checked rather than assumed.
 | `TestGuardConsistency` (1) | The default state directory agrees across Python, `versions.env` and shell |
 | `TestProfileBuilderRefusesUnsafeOutput` (3) | F-03 end to end through the CLI: refusal leaves the evidence intact, the documented invocation still works and leaves a marker, `--force` overrides only the ownership check |
 | `TestBundleBuilderGuard` (1) | F-03: the bundle builder refuses a directory that is not a bundle |
+| `TestShippedScriptModes` (2) | F-14: a script the docs tell the reader to run is executable; `lib/` scripts, which are sourced, are exempt |
+| `TestSharedLibraryResolution` (3) | F-13: no shipped module names a path the installer never creates; the state-directory fallback resolves `shared/`; with neither candidate the failure is explicit |
 | `TestIsolationConfig` (3) | The §6 recommendation: the shipped config keeps `forward_redirect`/`forward_tunnel` false, and the check catches a reopened forward (negative control) |
 
 `tests/test_conformance.py` — one new check, `[isolation] forwarding answered
@@ -649,7 +823,9 @@ drift.
 
 ## 6. Remediation status
 
-**All eleven findings are now fixed**, with the tests listed in §4. F-01 and
+**All fourteen findings are now fixed**, with the tests listed in §4. F-12 was
+found after the others, by driving the running interface against real Cowrie
+traffic rather than the fixture (see its section). F-01 and
 F-02 were fixed when they were found; F-03 through F-11 were fixed in the
 follow-up pass, which also closed the recommendation at the end of this section.
 
@@ -662,7 +838,11 @@ bounds raise and return 400; LIKE wildcards escaped), **F-07** (cookie-bound
 login CSRF token), **F-08** (accurate comments and one consolidated startup
 banner), **F-09** (session purge on startup and login; User-Agent binding
 implemented rather than the column dropped), **F-10** (rejected bodies close the
-connection), **F-11** (backticks escaped).
+connection), **F-11** (backticks escaped). **F-12** was found later, by running
+the interface against real Cowrie traffic instead of the fixture, and is fixed
+with the `session_recording` table plus the recording picker. **F-13** came out
+of the packaging check for F-03 and F-12, and **F-14** from following the
+installation document itself.
 
 Deliberately not done, and why: **per-source login throttling** (mentioned under
 F-05). It changes the meaning of a failed login for shared egress addresses and
@@ -686,10 +866,11 @@ follow-up session.
 | `realism/build_profile.py` | exit 0, 6/6 invariants, 25 artefacts |
 | `tests/test_conformance.py` (live lab, `127.0.0.1:2222`) | **197 / 198**, 0 actionable failures (1 `info` interop note) |
 | `tests/test_playback.py` | **32 / 32** |
-| `tests/test_dashboard.py` | **76 / 76** |
-| `tests/test_safety_guards.py` | **26 / 26** |
+| `tests/test_dashboard.py` | **81 / 81** |
+| `tests/test_safety_guards.py` | **31 / 31** |
 | `deploy/install.sh --dry-run` (the default) | exit 0, full 10-stage plan |
 | `bash -n` on all shipped shell scripts | clean |
+| `./deploy/install.sh --dry-run` (the command the docs give) | exit 0 — failed with permission denied before F-14 |
 
 Two notes on what these numbers do and do not say:
 
@@ -700,7 +881,29 @@ Two notes on what these numbers do and do not say:
   that, and the caveats in §5 — no browser, no fuzzing, no AWS verification —
   still stand for the fixed code too.
 
-One thing the follow-up pass did **not** re-derive: the audit's own measurements
+### Added after the live end-to-end run
+
+A second pass drove the whole pipeline against a real Cowrie instance rather
+than the synthetic bundle, and that is what found F-12:
+
+```
+lab (real sessions, real recordings)
+  -> dashboard/bundle.py --state lab --out <bundle>   451 events, 66 recordings, 1 capture
+  -> dashboard/ingest.py  --store <store> --bundle <b>  ingested, 0 duplicates
+  -> dashboard/server.py  --store <store>               every route 200
+```
+
+| Check | Result |
+|---|---|
+| `bundle.py` over a real state directory | 451 events, 66 recordings, 1 capture |
+| `ingest.py` into a fresh store | ingested; multi-recording sessions linked (8 and 64 recordings) |
+| `/healthz`, `/`, `/events`, `/sessions`, `/transfers`, `/health`, `/audit`, `/users` | 200 |
+| `/login`: missing, mismatched and stale tokens refused; valid token 303 + session | as designed |
+| `/api/session/<s>/<id>?sha=<h>` for a session's own recordings | each renders its own transcript |
+| `/api/session/...?sha=<hash not of this session>` | 404, never a substituted recording |
+| sessions list and CSV export | carry `recording_count` |
+
+One thing these passes did **not** re-derive: the audit's own measurements
 (quadratic-regex timings, the 50 MB peak per rendered recording) were not
 repeated. The code changed around them, so they remain the numbers for the
 pre-fix code; the fix's own tests assert behaviour (the read does not happen, the

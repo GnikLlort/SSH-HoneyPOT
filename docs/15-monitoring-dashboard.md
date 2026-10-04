@@ -105,6 +105,7 @@ These are structural, not policy:
 
 | Behaviour | Why |
 |---|---|
+| A session can have **many recordings**, and the page lists all of them | Cowrie starts a ttylog per *shell*, not per connection: a client that opens several channels on one connection (`ssh -M`, paramiko, most scripted toolkits) writes one per command. A real session in testing had 8; the conformance client's own run produced 64. The page shows the selected one and links the rest as `?sha=<hash>`; the sessions list and exports carry `recording_count` |
 | A recording above **8 MB** is listed but not rendered; you get its size, hash and a pointer to the offline workflow | Rendering builds the bytes, the parsed chunks and the JSON at once — measured at ~3× the file. A 64 MB recording would be ~192 MB per request, and the server has no natural concurrency limit. The limit is applied **before** the file is read |
 | At most **4 recordings render at once**; the fifth is told the renderer is busy | Same reason, from the other direction. The audit trail records `view.recording.deferred` |
 | A search with an unparsable date (`since=garbage`) returns **HTTP 400**, not results | A bound that cannot be parsed used to be dropped, which silently returned every event instead of none. For a tool that establishes what happened in a window, the wrong direction to fail is "wider" |
@@ -124,16 +125,40 @@ These are structural, not policy:
 | Response headers cannot be split by attacker text | `TestHeaderInjection` |
 | Filters fail loudly; LIKE wildcards are literal | `TestFilterValidation` |
 | Recording rendering is memory-bounded and concurrency-bounded | `TestPlaybackBounds` |
+| Every recording of a multi-shell session is reachable; an unknown hash is refused | `TestMultipleRecordings` |
+| The `shared/` library is found wherever the package is installed, and no module names a path no installer creates | `TestSharedLibraryResolution` |
+| Every script the docs tell a reader to run is executable | `TestShippedScriptModes` |
 | Expired sessions are purged; sessions are bound to a client | `TestSessionHousekeeping` |
 | The login POST is bound to the page the browser was served | `TestLoginCsrf` |
 | Relaxed controls are stated at startup | `TestRelaxedControls` |
 
-`AUDIT.md` is the adversarial record behind all of this: eleven findings, what
+`AUDIT.md` is the adversarial record behind all of this: fourteen findings, what
 each one was, how it was proven, and the test that now guards it.
 
 ---
 
-## 6. Known limitations
+## 6. One session, many recordings
+
+This surprises everyone the first time. A `session_id` identifies a connection;
+Cowrie starts a **separate ttylog per shell**, and every `exec` request is its
+own shell. So a session that ran eight commands through a multiplexed client has
+eight recordings, each with its own clock starting at zero, each covering one
+command and its output. `?sha=`, or the list on the session page, addresses them
+individually.
+
+Two consequences worth knowing before concluding "there is no recording of X":
+
+* The transcripts are **not** merged into one timeline, on purpose. Their offsets
+  are not comparable — each begins at its own shell's start — so a merged view
+  would look authoritative and be wrong. Use the *Cowrie events* tab for the
+  chronological record and the recordings for what the bytes looked like.
+* A `duplicate` recording has **no file of its own**: Cowrie deleted it because
+  an identical recording already existed under an earlier session's hash. The
+  page says so and names the hash; it is not a missing capture.
+
+---
+
+## 7. Known limitations
 
 * **Nothing here has run against the internet**, and the dashboard has never been
   exposed beyond loopback in any test. It is designed for a management path, not

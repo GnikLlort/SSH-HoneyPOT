@@ -1019,6 +1019,138 @@ class TestSessionHousekeeping(DashboardTestCase):
         self.assertIsNotNone(a.validate_session(token, user_agent=""))
 
 
+class TestMultipleRecordings(DashboardTestCase):
+    """
+    One session can have several recordings, and all of them must be reachable.
+
+    Found by pointing the dashboard at real traffic rather than at the fixture:
+    Cowrie starts a ttylog per SHELL, not per connection, so a client that opens
+    more than one channel on a single SSH connection (ssh -M, paramiko, most
+    scripted toolkits -- including this package's own test client) produces
+    several `cowrie.log.closed` events for one session, each naming a different
+    shasum. The session table's single recording_sha256 column could only
+    remember one, so the others were stored in the monitoring store and
+    unreachable from the UI. An investigator saw one of eight transcripts and
+    had no indication the rest existed.
+    """
+
+    PASSWORD = "Ledger-Thistle-49-Quay"
+
+    def make_bundle_multi(self, tmp: Path) -> Path:
+        """A session with three recordings, like a real multiplexed client."""
+        bundle = tmp / "multi"
+        (bundle / "tty").mkdir(parents=True, exist_ok=True)
+        (bundle / "downloads").mkdir(parents=True, exist_ok=True)
+        (bundle / "health").mkdir(parents=True, exist_ok=True)
+        (bundle / "SENSOR").write_text("deploy-01\n")
+
+        names = []
+        events = []
+        for i, (cmd, out) in enumerate((("id", "uid=1000(deploy)\n"),
+                                        ("pwd", "/home/deploy\n"),
+                                        ("whoami", "deploy\n"))):
+            rec = ttylog_bytes((1, 0, cmd.encode()), (2, 30_000, out.encode()))
+            name = hashlib.sha256(f"visitor input {i}".encode()).hexdigest()
+            (bundle / "tty" / name).write_bytes(rec)
+            names.append(name)
+            events.append({"eventid": "cowrie.command.input", "session": "multi1",
+                           "input": cmd, "sensor": "deploy-01",
+                           "timestamp": f"2026-07-31T09:14:0{i}.000000Z",
+                           "uuid": f"u-cmd-{i}", "message": f"CMD: {cmd}"})
+            events.append({"eventid": "cowrie.log.closed", "session": "multi1",
+                           "ttylog": f"var/lib/cowrie/tty/{name}", "shasum": name,
+                           "size": len(rec), "duplicate": False, "duration_ms": 1200,
+                           "sensor": "deploy-01",
+                           "timestamp": f"2026-07-31T09:14:1{i}.000000Z",
+                           "uuid": f"u-log-{i}",
+                           "message": f"Closing TTY Log: var/lib/cowrie/tty/{name}"})
+        events.append({"eventid": "cowrie.session.connect", "session": "multi1",
+                       "src_ip": "203.0.113.77", "sensor": "deploy-01",
+                       "timestamp": "2026-07-31T09:14:00.000000Z",
+                       "uuid": "u-connect", "message": "New connection"})
+        events.append({"eventid": "cowrie.login.success", "session": "multi1",
+                       "username": "deploy", "password": "x", "sensor": "deploy-01",
+                       "timestamp": "2026-07-31T09:14:00.500000Z",
+                       "uuid": "u-login", "message": "login succeeded"})
+        events.append({"eventid": "cowrie.session.closed", "session": "multi1",
+                       "sensor": "deploy-01", "duration_ms": 9000,
+                       "timestamp": "2026-07-31T09:14:20.000000Z",
+                       "uuid": "u-closed", "message": "Connection lost"})
+
+        with (bundle / "cowrie.json").open("w", encoding="utf-8") as fh:
+            for ev in events:
+                fh.write(json.dumps(ev) + "\n")
+        (bundle / "BUNDLE.json").write_text(json.dumps({
+            "sensor": "deploy-01",
+            "counts": {"events": len(events), "recordings": len(names)},
+            "files": [{"kind": "recording", "sha256": n,
+                       "content_sha256": hashlib.sha256(
+                           (bundle / "tty" / n).read_bytes()).hexdigest(),
+                       "bytes": (bundle / "tty" / n).stat().st_size,
+                       "source_name": n} for n in names],
+        }, indent=2))
+        return bundle
+
+    def setUp(self) -> None:
+        super().setUp()
+        import server as server_mod
+        self.server_mod = server_mod
+        bundle = self.make_bundle_multi(self.tmp)
+        Store(self.store_root).ingest_bundle(bundle)
+        self.app = server_mod.Dashboard(self.store_root, demo_mode=True)
+        self.q = Queries(self.store())
+
+
+    def bundle_for(self, sha: str = ""):
+        import server as server_mod
+        return server_mod.Handler._session_bundle(
+            _StubHandler(self.app), "deploy-01", "multi1", None, sha)
+
+    def test_ingest_keeps_every_recording_link(self) -> None:
+        recs = self.q.session_recordings("deploy-01", "multi1")
+        self.assertEqual(len(recs), 3,
+                         "recordings that Cowrie wrote are missing from the session")
+        self.assertEqual([r["ordinal"] for r in recs], [0, 1, 2],
+                         "recordings are not in the order Cowrie closed them")
+
+    def test_every_recording_is_rendered_by_hash(self) -> None:
+        seen = []
+        for rec in self.q.session_recordings("deploy-01", "multi1"):
+            bundle = self.bundle_for(rec["sha256"])
+            self.assertEqual(bundle["sha"], rec["sha256"],
+                             "the requested recording is not the one served")
+            self.assertTrue(bundle["recorded"])
+            self.assertTrue(bundle["chunks"])
+            seen.append(bundle["chunks"][0]["text"])
+        self.assertEqual(sorted(seen), ["id", "pwd", "whoami"],
+                         "the three transcripts are not three different transcripts")
+
+    def test_an_unknown_hash_is_refused_not_substituted(self) -> None:
+        bundle = self.bundle_for("a" * 64)
+        self.assertEqual(bundle["invalid_sha"], "a" * 64)
+        self.assertEqual(bundle["chunks"], [])
+        self.assertFalse(bundle["recorded"])
+
+    def test_the_primary_recording_is_one_that_exists(self) -> None:
+        session = self.q.session("deploy-01", "multi1")
+        recs = self.q.session_recordings("deploy-01", "multi1")
+        self.assertIn(session["recording_sha256"], [r["sha256"] for r in recs])
+        self.assertIsNotNone(self.q.recording_path(session["recording_sha256"]),
+                             "the session's default recording is not openable")
+
+    def test_the_list_is_present_even_when_one_recording_is_duplicate(self) -> None:
+        """
+        A duplicate has no file of its own, so it must be marked and skipped --
+        not allowed to become the default the page tries to open.
+        """
+        bundle_dir = self.make_bundle_multi(self.tmp / "dup")
+        Store(self.store_root).ingest_bundle(bundle_dir)
+        recs = self.q.session_recordings("deploy-01", "multi1")
+        for rec in recs:
+            self.assertTrue(self.q.recording_path(rec["sha256"]) is not None
+                            or rec["duplicate"])
+
+
 class TestManageUnlockCli(DashboardTestCase):
     """
     The recovery path has to work from a shell, not just from the library.

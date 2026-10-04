@@ -56,7 +56,10 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
-for _cand in (_HERE.parent / "shared", Path("/opt/honeypot-monitor/share")):
+# shared/ sits beside the package in a checkout and under
+# $STATE_DIR/share/pkg/ in an installed host (deploy/install.sh stage 8).
+_state = Path(os.environ.get("HONEYPOT_STATE_DIR") or "/opt/cowrie")
+for _cand in (_HERE.parent / "shared", _state / "share" / "pkg" / "shared"):
     if (_cand / "terminal_safety.py").is_file():
         sys.path.insert(0, str(_cand))
         break
@@ -110,7 +113,8 @@ def badge(text: object, css: str) -> str:
     return f'<span class="badge {css}">{R.esc(text, mask=False, limit=24)}</span>'
 
 
-def recording_badge(chunk_count: object, duplicate: object) -> str:
+def recording_badge(chunk_count: object, duplicate: object,
+                    recording_count: object = None) -> str:
     """
     Recording availability for a session row.
 
@@ -118,6 +122,16 @@ def recording_badge(chunk_count: object, duplicate: object) -> str:
     to an earlier one, so several sessions legitimately point at one file.
     """
     out = badge("recording", "info") if chunk_count else badge("none", "unk")
+    # Cowrie writes one ttylog per shell, so a session with several recordings
+    # is normal for any toolkit that opens more than one channel. Saying "3
+    # recordings" here is what stops a reviewer reading one of three
+    # transcripts and believing it is the session.
+    try:
+        count = int(recording_count or 0)
+    except (TypeError, ValueError):
+        count = 0
+    if count > 1:
+        out += " " + badge(f"{count} recordings", "info")
     if duplicate:
         out += " " + badge("shared", "unk")
     return out
@@ -814,7 +828,7 @@ class Handler(BaseHTTPRequestHandler):
             f'<td class="nowrap">{R.fmt_duration(s["duration_ms"])}</td>'
             f'<td class="nowrap">{int(s["command_count"])}</td>'
             f'<td class="nowrap">{int(s["transfer_count"])}</td>'
-            f'<td>{recording_badge(s["chunk_count"], s["recording_duplicate"])}</td>'
+            f'<td>{recording_badge(s["chunk_count"], s["recording_duplicate"], s.get("recording_count"))}</td>'
             f'<td><a href="/session/{quote(str(s["sensor"]))}/{quote(str(s["session_id"]))}">'
             f'{R.esc(s["session_id"], limit=24)}</a></td>'
             f'</tr>' for s in rows) or (
@@ -845,6 +859,17 @@ exists: an authentication attempt that never reached a shell is still evidence.<
                            self.app.csrf_for(principal.session_token))
 
     # -- session detail ----------------------------------------------------
+    def _wanted_recording(self) -> str:
+        """The ?sha= selection, validated as hex. The store re-checks it."""
+        try:
+            raw = parse_qs(urlsplit(self.path).query).get("sha", [""])[0]
+        except Exception:  # noqa: BLE001 - a malformed query is not fatal
+            return ""
+        raw = (raw or "").strip().lower()
+        if len(raw) != 64 or any(ch not in "0123456789abcdef" for ch in raw):
+            return ""
+        return raw
+
     def _split_path(self, path: str, prefix: str) -> tuple[str, str]:
         rest = path[len(prefix):].strip("/")
         bits = rest.split("/")
@@ -854,7 +879,7 @@ exists: an authentication attempt that never reached a shell is still evidence.<
         return unquote(bits[0]), unquote(bits[1])
 
     def _session_bundle(self, sensor: str, session_id: str,
-                        principal=None) -> dict | None:
+                        principal=None, wanted_sha: str = "") -> dict | None:
         """
         Assemble everything the viewer needs for one session.
 
@@ -876,9 +901,45 @@ exists: an authentication attempt that never reached a shell is still evidence.<
         chunks: list[dict] = []
         recorded = False
         note = ""
-        sha = session.get("recording_sha256") or ""
         size = None
         too_large = False
+
+        # A session can name several recordings: Cowrie starts a ttylog per
+        # shell, so a client that opens more than one channel on a single
+        # connection (ssh -M, paramiko, most scripted toolkits) produces one per
+        # command. Show all of them, and let ?sha= choose which to render.
+        listed = q.session_recordings(sensor, session_id)
+        recordings: list[dict] = []
+        for rec in listed:
+            present = q.recording_path(str(rec["sha256"])) is not None
+            recordings.append({"sha256": str(rec["sha256"]),
+                               "ordinal": int(rec["ordinal"] or 0),
+                               "bytes": int(rec.get("bytes") or 0),
+                               "duplicate": bool(rec.get("duplicate")),
+                               "chunk_count": rec.get("chunk_count"),
+                               "duration_ms": rec.get("duration_ms"),
+                               "present": present})
+
+        # The default is the session's primary recording when it is one of the
+        # listed ones, else the first. An unknown ?sha= is refused by the
+        # caller rather than silently falling back to a different recording:
+        # showing recording 3 when 7 was asked for is how a review reaches the
+        # wrong conclusion.
+        primary = str(session.get("recording_sha256") or "")
+        shas = [r["sha256"] for r in recordings]
+        sha = ""
+        if wanted_sha:
+            if wanted_sha in shas:
+                sha = wanted_sha
+            else:
+                return {"session": session, "chunks": [], "recorded": False,
+                        "note": "", "sha": "", "bytes": None, "too_large": False,
+                        "recordings": recordings, "invalid_sha": wanted_sha}
+        elif primary and primary in shas:
+            sha = primary
+        elif shas:
+            sha = shas[0]
+
         if sha:
             path = q.recording_path(sha)
             if path is not None:
@@ -923,24 +984,35 @@ exists: an authentication attempt that never reached a shell is still evidence.<
                     recorded = True
                     chunks = [{"offset_ms": c.offset_ms, "direction": c.direction,
                                "text": c.text} for c in parsed]
-            elif session.get("recording_duplicate"):
+            elif any(r["sha256"] == sha and r["duplicate"] for r in recordings):
                 recorded = True
-                note = ("This session's recording was byte-identical to an earlier one, so "
-                        "Cowrie stored it once under that earlier session's hash. Find the "
+                note = ("This recording was byte-identical to an earlier one, so Cowrie "
+                        "stored it once under that earlier session's hash. Find the "
                         "session with the same recording hash to view it.")
             else:
-                note = "The recording for this session is missing from the monitoring store."
+                note = "This recording is missing from the monitoring store."
+        elif recordings:
+            note = ("The recordings for this session are listed, but none of them is "
+                    "present in the monitoring store yet.")
         else:
             note = "No recording was captured for this session."
         return {"session": session, "chunks": chunks, "recorded": recorded,
-                "note": note, "sha": sha, "bytes": size, "too_large": too_large}
+                "note": note, "sha": sha, "bytes": size, "too_large": too_large,
+                "recordings": recordings, "invalid_sha": ""}
 
     def _session_api(self, principal, path: str) -> Response:
         sensor, session_id = self._split_path(path, "/api/session/")
-        bundle = self._session_bundle(sensor, session_id, principal)
+        wanted = self._wanted_recording()
+        bundle = self._session_bundle(sensor, session_id, principal, wanted)
         if bundle is None:
             return Response(b'{"error":"not found"}', status=404,
                             ctype="application/json; charset=utf-8")
+        if bundle.get("invalid_sha"):
+            # Explicitly refusing beats quietly serving a different recording.
+            return Response(
+                json.dumps({"error": "no such recording for this session",
+                            "sha256": bundle["invalid_sha"]}).encode("utf-8"),
+                status=404, ctype="application/json; charset=utf-8")
         # The API returns sanitised text, never raw bytes: the same treatment
         # the HTML path gets. A recording is untrusted input on both paths.
         from terminal_safety import safe_text
@@ -953,6 +1025,8 @@ exists: an authentication attempt that never reached a shell is still evidence.<
             "note": bundle["note"],
             "bytes": bundle["bytes"],
             "too_large": bundle["too_large"],
+            "sha256": bundle["sha"],
+            "recordings": bundle["recordings"],
         }
         self.app.auth.audit(principal.username, "view.recording",
                             target=f"{sensor}/{session_id}",
@@ -963,7 +1037,14 @@ exists: an authentication attempt that never reached a shell is still evidence.<
 
     def _session_detail(self, principal, path: str) -> Response:
         sensor, session_id = self._split_path(path, "/session/")
-        bundle = self._session_bundle(sensor, session_id, principal)
+        bundle = self._session_bundle(sensor, session_id, principal,
+                                      self._wanted_recording())
+        if bundle is not None and bundle.get("invalid_sha"):
+            return html_response(R.with_csrf(
+                R.page("Not found",
+                       '<h1>No such recording</h1><div class="notice warn">That '
+                       'recording hash is not one of this session\'s recordings.</div>',
+                       self.app.nonce, principal), ""), status=404)
         if bundle is None:
             return html_response(R.with_csrf(
                 R.page("Not found",
@@ -1036,6 +1117,55 @@ exists: an authentication attempt that never reached a shell is still evidence.<
             unmask_link += ('<div class="sub">Captured secrets are masked. Analysts can '
                             'reveal them, and doing so is audited.</div>')
 
+        recs = bundle["recordings"]
+        current_ordinal = next(
+            (i for i, r in enumerate(recs) if r["sha256"] == bundle["sha"]), 0)
+        if bundle["sha"]:
+            bits = [R.esc(bundle["sha"], mask=False, limit=64)]
+            if len(recs) > 1:
+                bits.append(f'<span class="sub">recording {current_ordinal + 1} '
+                            f'of {len(recs)}</span>')
+            chosen = next((r for r in recs if r["sha256"] == bundle["sha"]), None)
+            if chosen and chosen["duplicate"]:
+                bits.append('<span class="sub">shared with an earlier session</span>')
+            if chosen and not chosen["present"]:
+                bits.append('<span class="sub">not present in this store</span>')
+            recording_kv = " ".join(bits)
+        else:
+            recording_kv = "(none)"
+
+        # More than one recording is normal, not exotic: Cowrie starts a ttylog
+        # per shell, so a scripted client on one connection produces one per
+        # command. Listing them all is the difference between "this session has
+        # a recording" and "this session has eight, and you are looking at the
+        # third".
+        recording_picker = ""
+        if len(recs) > 1:
+            rows = ""
+            for r in recs:
+                mark_open = "<b>" if r["sha256"] == bundle["sha"] else ""
+                mark_close = "</b>" if r["sha256"] == bundle["sha"] else ""
+                facts = R.fmt_bytes(r["bytes"])
+                if r["chunk_count"] is not None:
+                    facts += f' &middot; {int(r["chunk_count"])} chunks'
+                if r["duplicate"]:
+                    facts += " &middot; duplicate"
+                if not r["present"]:
+                    facts += " &middot; missing from this store"
+                link = (f'/session/{quote(str(sensor))}/{quote(str(session_id))}'
+                        f'?sha={quote(r["sha256"])}')
+                rows += (f'<li>{mark_open}<a href="{link}">{r["ordinal"] + 1}. '
+                         f'{R.esc(r["sha256"], mask=False, limit=64)}</a>{mark_close} '
+                         f'<span class="sub">{facts}</span></li>')
+            recording_picker = (
+                '<div class="panel"><div class="k">Recordings for this session '
+                f'({len(recs)})</div>'
+                f'<ul class="sub" style="margin:6px 0 0 18px">{rows}</ul>'
+                '<div class="sub" style="margin-top:6px">Cowrie starts a recording per '
+                'shell, so a client that opened several channels on one connection has '
+                'one per command. The one shown above is selected; the others are here.'
+                '</div></div>')
+
         body = f"""
 <h1>Session {R.esc(session_id, limit=64)}</h1>
 <div class="sub">sensor {R.esc(sensor, limit=64)}</div>
@@ -1053,11 +1183,11 @@ exists: an authentication attempt that never reached a shell is still evidence.<
     <div class="k">commands</div><div class="v">{int(s["command_count"])}</div>
     <div class="k">transfers</div><div class="v">{int(s["transfer_count"])}</div>
     <div class="k">recording</div><div class="v">
-      {R.esc(bundle["sha"], mask=False, limit=64) if bundle["sha"] else "(none)"}
-      {"" if not s["recording_duplicate"] else " (shared with an earlier session)"}
+      {recording_kv}
     </div>
   </div>
 </div>
+{recording_picker}
 
 <div class="toolbar">
   <button id="play">Play</button>
@@ -1409,7 +1539,8 @@ role has any.
             rows, total = self.app.queries.sessions(f)
             columns = ["sensor", "session_id", "src_ip", "src_port", "started", "ended",
                        "duration_ms", "username", "login_result", "client_version",
-                       "command_count", "transfer_count", "recording_sha256"]
+                       "command_count", "transfer_count", "recording_sha256",
+                       "recording_count"]
         elif kind == "transfers":
             rows, total = self.app.queries.transfers(f)
             columns = ["sensor", "session_id", "timestamp", "event", "filename", "sha256",

@@ -55,7 +55,10 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
-for _cand in (_HERE.parent / "shared", Path("/opt/honeypot-monitor/share")):
+# shared/ sits beside the package in a checkout and under
+# $STATE_DIR/share/pkg/ in an installed host (deploy/install.sh stage 8).
+_state = Path(os.environ.get("HONEYPOT_STATE_DIR") or "/opt/cowrie")
+for _cand in (_HERE.parent / "shared", _state / "share" / "pkg" / "shared"):
     if (_cand / "terminal_safety.py").is_file():
         sys.path.insert(0, str(_cand))
         break

@@ -102,11 +102,11 @@ shared/
 tests/
   test_conformance.py     198 checks: the realism contract
   test_playback.py        32 checks: the reviewer's safety contract
-  test_dashboard.py       76 checks: sanitising, auth, filters, playback bounds
+  test_dashboard.py       81 checks: sanitising, auth, filters, playback bounds
   test_safety_guards.py   26 checks: delete guards and the isolation invariant
   probe_discovery.py      exploratory 84-command sweep
   lib/                    OpenSSH-based client and lab control
-AUDIT.md                  adversarial code audit: 11 findings, fixes and tests
+AUDIT.md                  adversarial code audit: 14 findings, fixes and tests
 docs/                     see below
 ```
 
@@ -153,10 +153,10 @@ Related material outside `docs/`:
 | Emulated host | Debian 12.5, kernel `6.1.0-21-amd64`, `OpenSSH_9.2p1 Debian-2+deb12u3` |
 | Conformance | **197 / 198**, 0 actionable failures (1 `info`-level interop note) |
 | Playback | **32 / 32** |
-| Dashboard | **76 / 76** |
-| Safety guards | **26 / 26** |
+| Dashboard | **81 / 81** |
+| Safety guards | **31 / 31** |
 | Profile build | 6 / 6 invariants |
-| Audit | 11 findings, all fixed; see [`AUDIT.md`](AUDIT.md) |
+| Audit | 14 findings, all fixed; see [`AUDIT.md`](AUDIT.md) |
 
 Fully pinned in [`deploy/versions.env`](deploy/versions.env) — Cowrie plus every
 transitive dependency, with the commit rather than the tag, because tags are

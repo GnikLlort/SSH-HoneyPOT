@@ -20,8 +20,8 @@
 | `realism/build_profile.py` | **exit 0**, 6/6 invariants | Generates 25 artefacts |
 | `tests/test_conformance.py` | **197 / 198 pass**, 0 actionable failures | 1 `info`-severity interop note. The extra check is the isolation config check added after the audit (section 8) |
 | `tests/test_playback.py` | **32 / 32 pass** | Includes a hostile-recording test |
-| `tests/test_dashboard.py` | **76 / 76 pass** | Was 47; the 29 added tests guard the audit findings (section 8) |
-| `tests/test_safety_guards.py` | **26 / 26 pass** | New: delete guards and the isolation invariant |
+| `tests/test_dashboard.py` | **81 / 81 pass** | Was 47; the added tests guard the audit findings (section 8) |
+| `tests/test_safety_guards.py` | **31 / 31 pass** | New: delete guards, the isolation invariant, shared/-resolution and script modes |
 | `deploy/install.sh` (dry run) | **exit 0**, full 10-stage plan printed | No changes made |
 | `deploy/uninstall.sh`, `deploy/rebuild.sh` | `bash -n` clean | Not executed — they are destructive |
 | Shell scripts (`ops/*.sh`, `deploy/*.sh`) | `bash -n` clean | All |
@@ -250,7 +250,7 @@ before and after.
   Debian 12.5 host** — the gaps in section 6 stand.
 * **The dashboard now has a page in `docs/`** — `docs/15-monitoring-dashboard.md`,
   added in the follow-up pass. Its behaviour is covered by
-  `tests/test_dashboard.py` (76 tests) and `AUDIT.md`; the findings there
+  `tests/test_dashboard.py` (81 tests) and `AUDIT.md`; the findings there
   (F-03 to F-11) are fixed, each with the test that guards it.
 
 ---
@@ -259,14 +259,16 @@ before and after.
 
 **Run:** 2026-10-04, same machine, against a freshly generated profile and a
 freshly initialised lab, after the working tree that `AUDIT.md` describes was
-changed to fix F-03 through F-11.
+changed to fix F-03 through F-11, plus F-12 to F-14 (found afterwards by
+driving the dashboard against real traffic, by reproducing the installer's
+layout, and by following the installation document).
 
 | Suite | Result |
 |---|---|
 | `realism/build_profile.py` | exit 0, 6/6 invariants |
 | `tests/test_conformance.py` | **197 / 198**, 0 actionable (1 `info` interop note) |
-| `tests/test_dashboard.py` | **76 / 76** |
-| `tests/test_safety_guards.py` | **26 / 26** |
+| `tests/test_dashboard.py` | **81 / 81** |
+| `tests/test_safety_guards.py` | **31 / 31** |
 | `tests/test_playback.py` | **32 / 32** |
 | `deploy/install.sh` (dry run) | exit 0, full 10-stage plan |
 | `bash -n` on every shipped shell script | clean |
@@ -275,15 +277,18 @@ What the new tests establish, by finding:
 
 | Finding | Fix | Guarded by |
 |---|---|---|
-| F-03 destructive delete | `shared/safe_paths.py` + `deploy/lib/guards.sh`; `--force-recursive-delete` / `--force-path` | `test_safety_guards.py` (26) |
+| F-03 destructive delete | `shared/safe_paths.py` + `deploy/lib/guards.sh`; `--force-recursive-delete` / `--force-path` | `test_safety_guards.py` (31) |
 | F-04 unbounded recording render | 8 MB limit applied before the read; 4 concurrent renders | `TestPlaybackBounds` (6) |
-| F-05 lockout with no recovery | `manage.py unlock` | `TestAuthentication`, manual CLI check |
+| F-05 lockout with no recovery | `manage.py unlock` | `TestManageUnlockCli` (2) |
 | F-06 filters that silently widen | `FilterError` → HTTP 400; LIKE escaping | `TestFilterValidation` (6) |
 | F-07 login CSRF | cookie-bound double-submit token | `TestLoginCsrf` (7) |
 | F-08 overstated control in a comment | corrected comments; consolidated startup banner | `TestRelaxedControls` (3) |
 | F-09 dead code implying controls | purge on startup and login; User-Agent binding implemented | `TestSessionHousekeeping` (4) |
 | F-10 undrained rejected body | the connection is closed | `TestLoginCsrf` (1) |
 | F-11 backticks not escaped | escaped in `safe_html` | `TestHtmlEscaping` (2) |
+| F-12 one recording of several shown | `session_recording` table + migration, picker and `?sha=` | `TestMultipleRecordings` (5) |
+| F-13 a `shared/` fallback path nothing created | installed location derived from `HONEYPOT_STATE_DIR` | `TestSharedLibraryResolution` (3) |
+| F-14 `install.sh` not executable | `chmod +x`; the mode was the exception, not the docs | `TestShippedScriptModes` (2) |
 | isolation invariant | conformance check reads `config/cowrie.cfg` | `TestIsolationConfig` (3) + `[isolation]` in the suite |
 
 Two limits of this table, stated rather than implied:

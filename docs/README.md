@@ -35,7 +35,7 @@ Related material outside `docs/`:
 * `deploy/aws/security-groups.md` — security groups, routing, IAM, verification
 * `ops/alerts/rules.md` — alert rules, thresholds and response
 * `deploy/versions.env` — the single source of every version pin
-* `AUDIT.md` — adversarial audit of the dashboard and the package: 11 findings,
+* `AUDIT.md` — adversarial audit of the dashboard and the package: 14 findings,
   each with the proof and the test that now guards it
 
 ---
