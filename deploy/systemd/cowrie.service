@@ -1,0 +1,132 @@
+# =============================================================================
+# Cowrie honeypot service
+# =============================================================================
+# Install to: /etc/systemd/system/cowrie.service
+#
+# Design notes
+# ------------
+# * Runs as the unprivileged `cowrie` account, never root. Binding to port 22
+#   is granted by CAP_NET_BIND_SERVICE alone rather than by running as root.
+# * A long list of sandboxing directives. These are defence in depth: the
+#   emulated shell never executes anything on the host, so the honeypot should
+#   never need most of what they deny.
+# * ProtectSystem=strict makes the entire filesystem read-only except the
+#   paths listed in ReadWritePaths. If Cowrie is ever made to write somewhere
+#   unexpected, the write fails loudly instead of succeeding quietly.
+# * Restart=always plus a start limit, so a crash is recovered but a crash
+#   loop does not spin forever unnoticed.
+# * TimeoutStopSec is short. Cowrie's reactor can become wedged by a
+#   pathological command (see docs/10); when it does, it ignores SIGTERM and
+#   systemd must escalate to SIGKILL. Without this the stop would hang for the
+#   default 90 seconds on every restart.
+# =============================================================================
+
+[Unit]
+Description=Cowrie SSH honeypot
+Documentation=file:/opt/cowrie/DEPLOYMENT.txt
+After=network-online.target
+Wants=network-online.target
+# Do not start if something else already owns the port; the failure mode is
+# otherwise a confusing "Address already in use" in the journal.
+ConditionPathExists=/opt/cowrie/etc/cowrie.cfg
+
+[Service]
+Type=forking
+User=cowrie
+Group=cowrie
+WorkingDirectory=/opt/cowrie
+PIDFile=/opt/cowrie/var/run/cowrie.pid
+
+# --- environment -------------------------------------------------------------
+# COWRIE_STDOUT=yes keeps twistd in the foreground so systemd supervises the
+# real process rather than a daemon that has already forked away.
+Environment=COWRIE_STDOUT=yes
+Environment=HOME=/opt/cowrie
+Environment=PYTHONUNBUFFERED=1
+# Optional realism overlay. Set COWRIE_REALISM_OVERLAY=0 to run stock Cowrie.
+Environment=PYTHONPATH=/opt/cowrie/share/overlay
+Environment=COWRIE_REALISM_OVERLAY=1
+# Timezone must be UTC so that every timestamp in every log is comparable.
+Environment=TZ=UTC
+
+# `cowrie start` shells out to twistd, which must be on PATH.
+Environment=PATH=/opt/cowrie/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+ExecStart=/opt/cowrie/venv/bin/cowrie start
+ExecStop=/opt/cowrie/venv/bin/cowrie stop
+# If SIGTERM does not take (wedged reactor), escalate quickly.
+TimeoutStopSec=20
+KillMode=mixed
+Restart=always
+RestartSec=10
+
+# Allow binding to port 22 without running as root. CapabilityBoundingSet
+# keeps every other capability away from the process.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+
+# --- filesystem --------------------------------------------------------------
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+# The honeypot needs to write exactly here and nowhere else.
+ReadWritePaths=/opt/cowrie/var
+ReadOnlyPaths=/opt/cowrie/etc /opt/cowrie/share
+
+# Mask the real host's memory layout inside this unit's private mount
+# namespace. Stock Cowrie's `free` command reads /proc/meminfo directly (see
+# cowrie/commands/free.py), which leaks the real instance's RAM to the visitor
+# and contradicts the emulated /proc/meminfo. Configuration cannot reach that
+# code path.
+#
+# Binding the synthetic file over /proc/meminfo means the honeypot process
+# cannot observe the real values at all - so the leak stays fixed even if the
+# realism overlay fails to load or is disabled. The rest of the host is
+# unaffected: the mount lives only in this namespace.
+#
+# Verified with: unshare -m --map-root-user sh -c \
+#     'mount --bind <file> /proc/meminfo; head -1 /proc/meminfo'
+BindReadOnlyPaths=/opt/cowrie/share/synthetic/meminfo:/proc/meminfo
+
+# --- kernel / process --------------------------------------------------------
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+# Cowrie emulates tcpip forwarding inside the SSH protocol; it never opens a
+# real socket to the requested destination. Restricting address families to
+# AF_UNIX/AF_INET/AF_INET6 still lets it accept SSH connections and log.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# --- resource limits ---------------------------------------------------------
+# A visitor must not be able to exhaust the host. These are deliberately
+# generous enough for real traffic and firm enough to contain an attack on the
+# honeypot itself.
+LimitNOFILE=8192
+MemoryMax=1G
+MemoryHigh=768M
+CPUQuota=150%
+TasksMax=256
+# Captured files can otherwise fill the disk; ops/prune_local.sh enforces the
+# retention policy, and this is the backstop.
+LimitFSIZE=256M
+
+# --- logging -----------------------------------------------------------------
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cowrie
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,303 @@
+# =============================================================================
+# Synthetic host identity - SINGLE SOURCE OF TRUTH
+# =============================================================================
+#
+# Everything the visitor can see about the fake machine is derived from this
+# file by realism/build_profile.py. Nothing here is real: no real people, no
+# real organisations, no real credentials, no real network addresses.
+#
+# Why one file: the most common way a honeypot is unmasked is not a bug in
+# Cowrie, it is two answers to the same question disagreeing. `uname -a` says
+# one kernel while `/proc/version` says another; `ls -l /etc/fstab` reports
+# 37 bytes while `cat /etc/fstab` prints nothing. Deriving every artefact from
+# one manifest makes those contradictions a build error instead of a silent
+# fingerprint.
+#
+# Changing a value here and re-running the generator regenerates every
+# dependent artefact (config fragment, honeyfs files, txtcmds, custom
+# fs.pickle, and the conformance expectations the test suite asserts against).
+#
+# See docs/04-config-reference.md for what each field controls.
+# =============================================================================
+
+schema_version: 1
+
+identity:
+  # Short hostname. Must appear identically in:
+  #   [honeypot] hostname, /etc/hostname, /etc/hosts (127.0.1.1 line),
+  #   the shell prompt, `hostname`, `uname -n`.
+  hostname: deploy-01
+  # RFC 6761 reserved TLD - guaranteed never to resolve to a real domain.
+  domain: hq.example.net
+  fqdn: deploy-01.hq.example.net
+  # Free-text description of what this machine pretends to be. Used to keep
+  # the decoy documents, service logs and installed-package list on-message.
+  role: internal build and artifact server
+  timezone: UTC
+
+os:
+  id: debian
+  name: Debian GNU/Linux
+  version_id: "12"
+  # /etc/debian_version. Bookworm point releases do not change the kernel
+  # ABI name in the window covered by this profile.
+  point_release: "12.5"
+  codename: bookworm
+  # Kernel ABI name and the exact build string. These two must stay paired:
+  # `uname -r` prints kernel_abi, `uname -v` prints kernel_build_string, and
+  # /proc/version prints both together.
+  kernel_abi: 6.1.0-21-amd64
+  kernel_build_string: "#1 SMP PREEMPT_DYNAMIC Debian 6.1.90-1 (2024-05-03)"
+  kernel_package: linux-image-6.1.0-21-amd64
+  # OpenSSH as reported by the SSH protocol banner, by `ssh -V` inside the
+  # emulated shell, and by the installed-package list. All three must agree.
+  openssh_banner: "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u3"
+  openssh_shell_version: "OpenSSH_9.2p1 Debian-2+deb12u3, OpenSSL 3.0.13 30 Jan 2024"
+  openssl_version: "3.0.13"
+  openssh_package_version: "1:9.2p1-2+deb12u3"
+  # Seconds before the honeypot process started that the emulated machine
+  # booted. PINNED rather than left to Cowrie's random 1-90 day default, so
+  # that process start times, `last`, log timestamps and /proc/uptime can all
+  # be generated consistently with one another.
+  boot_offset_seconds: 1209600   # 14 days
+
+hardware:
+  architecture: x86_64
+  # Virtualisation is presented as KVM because the bundled /proc/cpuinfo and
+  # `lscpu` vulnerability tables are built around a KVM guest. Changing this
+  # without regenerating the CPU files creates a VMware-vs-KVM contradiction.
+  hypervisor: KVM
+  cpu:
+    model_name: "Intel(R) Xeon(R) CPU E5-2680 v4 @ 2.40GHz"
+    vendor_id: GenuineIntel
+    cpu_family: 6
+    model: 79
+    stepping: 1
+    microcode: "0xb000040"
+    # Total logical processors. Everything derived from this: nproc,
+    # lscpu "CPU(s)", the number of `processor :` stanzas in /proc/cpuinfo,
+    # and the "On-line CPU(s) list".
+    logical_cpus: 2
+    sockets: 1
+    cores_per_socket: 2
+    threads_per_core: 1
+    mhz: 2399.998
+    bogomips: 4799.99
+    cache_kb: 35840          # /proc/cpuinfo "cache size" (L3, per socket)
+    l1d_kib: 64
+    l1i_kib: 64
+    l2_kib: 512
+    l3_mib: 35
+  memory:
+    # /proc/meminfo MemTotal, in kB. Drives tmpfs sizes in df/mount/fstab:
+    #   /run      ~ 10% of MemTotal
+    #   /dev/shm  ~ 50% of MemTotal
+    total_kb: 4054744
+    swap_total_kb: 2097148
+
+storage:
+  # Root block device and its filesystem identity. The UUID appears in
+  # /etc/fstab and in df/mount output, so it must be stated once here.
+  root_device: /dev/nvme0n1p1
+  root_uuid: 7f3c1a92-5c4e-4b21-9d77-1e2ab6f0c834
+  root_filesystem: ext4
+  root_size_gb: 40
+  root_used_gb: 8.7
+  esp_device: /dev/nvme0n1p15
+  esp_uuid: 4A21-B7C0
+  esp_size_mb: 124
+  esp_used_mb: 12
+
+network:
+  # Presented by ifconfig, netstat routing output and /etc/resolv.conf.
+  # This is what makes [honeypot] internet_facing_ip mandatory: if it is left
+  # unset, Cowrie derives the address from the real outbound socket and the
+  # honeypot advertises its own host's address.
+  interface: eth0
+  mac: "02:1f:5a:9c:4b:e7"     # locally administered, 02: prefix
+  address: 10.20.30.40
+  prefix_len: 24
+  netmask: 255.255.255.0
+  broadcast: 10.20.30.255
+  gateway: 10.20.30.1
+  nameservers:
+    - 10.20.30.2
+    - 10.20.30.3
+  search_domains:
+    - hq.example.net
+
+accounts:
+  # The interactive account the visitor lands on. uid/gid must match the
+  # passwd/group/shadow entries and the ownership of /home/<name>.
+  - name: deploy
+    uid: 1000
+    gid: 1000
+    gecos: "Deployment Operator"
+    home: /home/deploy
+    shell: /bin/bash
+    groups: [cdrom, floppy, audio, dip, video, plugdev, users, sudo]
+    # Passwords for the emulated host are NOT real and are never usable
+    # anywhere. They exist only so that the userdb can admit a visitor.
+    password: "Sunrise-Ledger-1972"
+  - name: svc-backup
+    uid: 1001
+    gid: 1001
+    gecos: "Backup Service Account"
+    home: /home/svc-backup
+    shell: /usr/sbin/nologin
+    groups: [users]
+    password: "!"
+
+filesystem:
+  # Percentage of root that df reports as used is derived from
+  # storage.root_used_gb; do not restate it here.
+  #
+  # Decoy documents planted for the visitor to find. All content is invented.
+  decoys:
+    - path: /home/deploy/notes/handover-2026-07.txt
+      mode: "0644"
+      owner: deploy
+      content: |
+        Handover notes - build server (deploy-01)
+        =========================================
+        Open items:
+          * Rotate the artifact-signing key before the next release freeze.
+            Old key fingerprint is recorded in the team password manager, NOT here.
+          * The nightly artifact sync to the mirror still uses the legacy path.
+            Tracked as BUILD-4417. Owner: platform team.
+          * Disk is filling up on the build volume. Clean old bundles weekly.
+
+        Reminder to self: this box is reachable from the office VPN only.
+    - path: /home/deploy/projects/artifacts/README.md
+      mode: "0644"
+      owner: deploy
+      content: |
+        # artifacts
+
+        Scratch space for build outputs. Nothing here is a source of truth.
+        Source lives in the internal git service, not on this host.
+
+        Convention:
+          dist/       staged release bundles (deleted after publication)
+          staging/    in-flight builds, safe to delete
+          archive/    superseded bundles kept for 30 days
+
+    - path: /home/deploy/projects/artifacts/staging/build-manifest.json
+      mode: "0644"
+      owner: deploy
+      content: |
+        {
+          "build_id": "2026.07.31-rc3",
+          "produced_by": "deploy-01",
+          "artifacts": [
+            {"name": "webapp-2.14.0.jar", "sha256": "CANARY_SHA256_BUILD_MANIFEST"},
+            {"name": "webapp-2.14.0-sources.tar.gz", "sha256": "9c1e0f4a7b2d38e5c6a1f0d9b8e7c6a5d4b3c2a1f0e9d8c7b6a5f4e3d2c1b0a9"}
+          ],
+          "note": "staging only - do not distribute"
+        }
+    - path: /home/deploy/.bash_history
+      mode: "0600"
+      owner: deploy
+      content: |
+        ls -la
+        cd projects/artifacts
+        df -h
+        tail -n 50 /var/log/syslog
+        systemctl status nginx
+        git -C ~/projects/artifacts status
+        exit
+
+  # Service logs planted for realism. These are what an operator greps during
+  # situational awareness. Timestamps are generated relative to boot_offset.
+  logs:
+    - path: /var/log/syslog
+      mode: "0640"
+      owner: root
+      group: adm
+      generator: syslog
+    - path: /var/log/auth.log
+      mode: "0640"
+      owner: root
+      group: adm
+      generator: authlog
+    - path: /var/log/kern.log
+      mode: "0640"
+      owner: root
+      group: adm
+      generator: kernlog
+    - path: /var/log/nginx/access.log
+      mode: "0640"
+      owner: www-data
+      group: adm
+      generator: nginx_access
+    - path: /var/log/nginx/error.log
+      mode: "0640"
+      owner: www-data
+      group: adm
+      generator: nginx_error
+
+  # Files that must exist with real metadata for the story to hold together.
+  # Sizes are computed from content by the generator; never hand-written.
+  required_files:
+    - /etc/crontab
+    - /etc/environment
+    - /etc/ssh/sshd_config
+    - /etc/ssh/ssh_config
+    - /etc/fstab
+    - /etc/hosts
+    - /etc/hostname
+    - /usr/lib/os-release
+    - /etc/debian_version
+    - /etc/issue
+    - /etc/issue.net
+    - /etc/motd
+    - /etc/resolv.conf
+    - /etc/passwd
+    - /etc/group
+    - /etc/shadow
+
+  # Paths that must NOT be visible. The generator fails the build if any of
+  # these resolve to a real file in the finished pickle.
+  forbidden_paths:
+    - /.dockerenv
+    - /.dockerinit
+    - /var/lib/cowrie
+    - /home/cowrie
+    - /opt/cowrie
+
+canaries:
+  # Unique, high-entropy markers. Nothing should ever leak these, and
+  # ops/canary_scan.sh searches the real host for them. If one appears
+  # anywhere outside the emulated filesystem, the honeypot host has
+  # contaminated itself with honeypot content (or vice versa).
+  - id: CANARY_FS_MARKER
+    value: "HPX-4f8a1c93-3d72-4ce1-9b6a-7f2e5d08a1b4"
+    description: Planted in a decoy document so filesystem exfiltration is traceable.
+  - id: CANARY_SHA256_BUILD_MANIFEST
+    value: "b7d3e1f9a2c4b6d8e0f1a3c5b7d9e1f3a5c7b9d1e3f5a7c9b1d3e5f7a9c1b3d5"
+    description: Planted in the staging build manifest.
+  - id: CANARY_DNS_SEARCHDOMAIN
+    value: "hq.example.net"
+    description: Must never appear in real host configuration.
+
+alerts:
+  # Thresholds consumed by the alert rules in ops/alerts/.
+  repeated_login_attempts:
+    count: 5
+    window_seconds: 300
+  sensitive_command_patterns:
+    - "cat /etc/shadow"
+    - "cat /etc/passwd"
+    - "wget "
+    - "curl "
+    - "chmod +x"
+    - "base64 -d"
+    - "/dev/tcp/"
+    - "nc -e"
+    - "crontab -"
+    - "authorized_keys"
+  disk_growth:
+    download_dir_warn_mb: 2048
+    download_dir_critical_mb: 4096
+    filesystem_warn_percent: 80
+    filesystem_critical_percent: 92

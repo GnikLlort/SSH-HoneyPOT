@@ -1,0 +1,15 @@
+[Unit]
+Description=Cowrie honeypot health check
+Documentation=file:/opt/cowrie/DEPLOYMENT.txt
+# No dependencies: the check must run even when the honeypot is down, which is
+# precisely when it matters.
+
+[Service]
+Type=oneshot
+User=root
+Environment=TZ=UTC
+ExecStart=/usr/local/sbin/healthcheck.sh
+# The check is read-only except for the alert state file it maintains.
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=120
