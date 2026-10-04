@@ -349,6 +349,31 @@ What to look for in the first hour:
 
 ---
 
+## Updating an installed sensor
+
+An update is the installer run again from the source checkout, which is
+idempotent. `deploy/update.sh` wraps it with a dry run, a dirty-tree check and
+a recorded rollback path:
+
+```bash
+cd /root/honeypot-src
+sudo git fetch origin
+sudo ./deploy/update.sh --ref <branch-or-commit>            # dry run
+sudo ./deploy/update.sh --ref <branch-or-commit> --apply
+```
+
+`docs/17` is the full procedure: what an update overwrites, what it never
+touches, how to verify it and how to roll back.
+
+To feed the off-host monitoring dashboard from this host, enable the bundle
+shipper (installed but not enabled) and follow `docs/16`:
+
+```bash
+sudo systemctl enable --now cowrie-bundle-ship.timer
+```
+
+---
+
 ## Uninstall / roll back
 
 See `docs/11-rollback-and-rebuild.md`. Two commands, and the difference between

@@ -253,7 +253,20 @@ def main() -> int:
     print(f"  captures:   {c['downloads']}")
     print(f"  health:     {c['health_lines']} lines")
     if manifest["skipped"]:
-        print(f"  skipped:    {len(manifest['skipped'])} oversized capture(s)")
+        # Report by reason. The old line said "oversized capture(s)" for every
+        # skipped item, so a ttylog whose filename was not a lowercase sha256 --
+        # which is the reason a session shows no recording at all -- was
+        # reported as an oversized upload. The number was right; the cause was
+        # wrong, and the cause is the whole point of the line.
+        by_reason: dict[str, int] = {}
+        for item in manifest["skipped"]:
+            reason = str(item.get("reason") or "skipped")
+            reason = reason.split(" (")[0]
+            by_reason[reason] = by_reason.get(reason, 0) + 1
+        print(f"  skipped:    {len(manifest['skipped'])} file(s)")
+        for reason, count in sorted(by_reason.items()):
+            print(f"                {count} x {reason}")
+        print("              see BUNDLE.json for the names")
     return 0
 
 

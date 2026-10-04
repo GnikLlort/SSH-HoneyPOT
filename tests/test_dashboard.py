@@ -1194,6 +1194,110 @@ class TestManageUnlockCli(DashboardTestCase):
         self.assertIn("no such user", proc.stderr)
 
 
+class TestManageProvisioningCli(DashboardTestCase):
+    """
+    The first account on a fresh monitoring host.
+
+    Two things stood between an operator and a working sign-in, and both were
+    reported by someone following the docs rather than guessed at:
+
+      * `adduser` refused to run before the first bundle had ever been
+        ingested, because there was no store to write to -- and every
+        instruction that mentions accounts came before the ingest step. `init`
+        is the missing command.
+      * with no terminal on stdin it raised a bare EOFError traceback, which
+        says nothing about the actual problem (no TTY) or the solution
+        (--password-stdin).
+
+    The password still never appears in argv: --password-stdin exists so this
+    can be automated without putting a captured-credential-adjacent secret in
+    the process table and in shell history.
+    """
+
+    PASSWORD = "Ledger-Thistle-49-Quay"
+
+    def run_cli(self, *args: str, stdin: str | None = None):
+        return subprocess.run(
+            [sys.executable, str(ROOT / "dashboard" / "manage.py"),
+             "--store", str(self.store_root), *args],
+            capture_output=True, text=True, cwd=str(ROOT), timeout=120,
+            input=None if stdin is None else stdin,
+            stdin=subprocess.DEVNULL if stdin is None else None)
+
+    def test_init_creates_a_store_before_any_bundle_has_arrived(self) -> None:
+        self.assertFalse((self.store_root / "store.sqlite3").exists())
+        proc = self.run_cli("init")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue((self.store_root / "store.sqlite3").is_file())
+        self.assertIn("adduser", proc.stdout, "init does not say what to do next")
+
+        again = self.run_cli("init")
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertIn("already present", again.stdout)
+
+    def test_adduser_works_without_a_terminal(self) -> None:
+        self.run_cli("init")
+        proc = self.run_cli("adduser", "--username", "ops1", "--role", "admin",
+                            "--password-stdin", stdin=self.PASSWORD + "\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("created ops1", proc.stdout)
+        user = Authenticator(Store(self.store_root)).get_user("ops1")
+        self.assertIsNotNone(user, "the account was not created")
+        self.assertTrue(user["totp_enabled"])
+        self.assertNotIn(self.PASSWORD, proc.stdout,
+                         "the password was echoed back")
+
+    def test_a_weak_password_on_stdin_is_rejected_and_creates_nothing(self) -> None:
+        self.run_cli("init")
+        proc = self.run_cli("adduser", "--username", "ops2", "--role", "viewer",
+                            "--password-stdin", stdin="short\n")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("password rejected", proc.stderr)
+        self.assertIsNone(Authenticator(Store(self.store_root)).get_user("ops2"))
+
+    def test_an_empty_stdin_password_is_an_error_not_an_account(self) -> None:
+        self.run_cli("init")
+        proc = self.run_cli("adduser", "--username", "ops3", "--password-stdin",
+                            stdin="")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("stdin was empty", proc.stderr)
+
+    def test_no_terminal_and_no_flag_says_what_to_do(self) -> None:
+        """The EOFError traceback, as a test."""
+        self.run_cli("init")
+        proc = self.run_cli("adduser", "--username", "ops4")
+        self.assertEqual(proc.returncode, 2,
+                         "expected a usage error, got:\n" + proc.stderr[-800:])
+        self.assertIn("not a terminal", proc.stderr)
+        self.assertIn("--password-stdin", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+
+    def test_passwd_on_stdin_revokes_existing_sessions(self) -> None:
+        self.run_cli("init")
+        self.run_cli("adduser", "--username", "ops5", "--role", "admin",
+                     "--password-stdin", stdin=self.PASSWORD + "\n")
+        auth = Authenticator(Store(self.store_root))
+        secret = auth.get_user("ops5")["totp_secret"]
+        _, token = auth.login("ops5", self.PASSWORD, totp_at(secret), "10.0.0.1")
+        self.assertTrue(token)
+
+        new_password = "Cinder-Vellum-88-Tarn"
+        proc = self.run_cli("passwd", "--username", "ops5", "--password-stdin",
+                            stdin=new_password + "\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        auth = Authenticator(Store(self.store_root))
+        self.assertIsNone(auth.validate_session(token),
+                          "the old session survived a password change")
+        _, token = auth.login("ops5", new_password, totp_at(secret), "10.0.0.1")
+        self.assertTrue(token, "the new password does not work")
+
+    def test_commands_without_a_store_point_at_init(self) -> None:
+        proc = self.run_cli("list")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("init", proc.stderr,
+                      "the error does not name the command that fixes it")
+
+
 # ----------------------------------------------------------------------
 # Login CSRF (AUDIT F-07)
 # ----------------------------------------------------------------------
@@ -1331,6 +1435,109 @@ class TestLoginCsrf(DashboardTestCase):
             self.assertEqual(sock.recv(1), b"")
         finally:
             sock.close()
+
+
+class TestRejectedLogin(DashboardTestCase):
+    """
+    A rejected sign-in is a 401 with a message, not an internal error.
+
+    What this caught: the AuthError handler wrapped `self._login_page(...)` --
+    which already returns a Response -- in `html_response(...)`, which calls
+    `.encode("utf-8")` on it. Every rejected sign-in therefore raised
+    AttributeError inside the error path and the browser got an HTTP 500 with
+    "Something went wrong", while the real reason (wrong password, bad code,
+    locked account) was only in the service log. The audit trail's
+    login.failed rows were written the whole time, which is why nothing
+    noticed: the failure was recorded correctly and reported to nobody.
+    """
+
+    PASSWORD = "Ledger-Thistle-49-Quay"
+
+    def setUp(self) -> None:
+        super().setUp()
+        import server as server_mod
+        self.server_mod = server_mod
+        self.ingest()
+        # MFA ENFORCED here, deliberately: the bad-TOTP path is one of the
+        # three ways in which this handler is reached.
+        self.app = server_mod.Dashboard(self.store_root)
+        self.secret = self.app.auth.create_user("admin1", self.PASSWORD, "admin",
+                                                actor="test")
+        handler = type("TestHandler", (_NoLogHandlerMixin, server_mod.Handler), {})
+        handler.app = self.app
+        handler.secure_cookies = False
+        self.server = server_mod.TCPHTTPServer(("127.0.0.1", 0), handler)
+        self.port = self.server.server_address[1]
+        thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(self.server.shutdown)
+        self.addCleanup(self.server.server_close)
+        self.jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.jar))
+        self.base = f"http://127.0.0.1:{self.port}"
+
+    def post_login(self, **fields: str):
+        page = self.opener.open(self.base + "/login", timeout=10).read().decode("utf-8")
+        token = re.search(r'name="csrf" value="([^"]+)"', page).group(1)
+        data = {"csrf": token, **fields}
+        req = urllib.request.Request(
+            self.base + "/login", data=urllib.parse.urlencode(data).encode(),
+            method="POST")
+        try:
+            return self.opener.open(req, timeout=10)
+        except urllib.error.HTTPError as exc:
+            return exc
+
+    def assert_refused(self, response, expected: str) -> str:
+        body = response.read().decode("utf-8", "replace")
+        self.assertEqual(response.status, 401,
+                         f"a rejected sign-in returned {response.status}, not 401:\n{body[:400]}")
+        self.assertIn(expected, body)
+        self.assertNotIn("Something went wrong", body,
+                         "the failure was reported as an internal error")
+        return body
+
+    def test_a_wrong_password_is_refused_with_a_message(self) -> None:
+        self.assert_refused(
+            self.post_login(username="admin1", password="wrong-password",
+                            totp=totp_at(self.secret)),
+            "Invalid credentials")
+
+    def test_an_unknown_account_is_refused(self) -> None:
+        self.assert_refused(
+            self.post_login(username="nobody", password=self.PASSWORD, totp="000000"),
+            "Invalid credentials")
+
+    def test_a_bad_totp_code_is_refused(self) -> None:
+        self.assert_refused(
+            self.post_login(username="admin1", password=self.PASSWORD, totp="123456"),
+            "Invalid credentials")
+
+    def test_a_missing_totp_code_is_refused(self) -> None:
+        self.assert_refused(
+            self.post_login(username="admin1", password=self.PASSWORD, totp=""),
+            "Invalid credentials")
+
+    def test_a_locked_account_says_so(self) -> None:
+        for _ in range(5):
+            self.post_login(username="admin1", password="wrong-password", totp="000000")
+        self.assert_refused(
+            self.post_login(username="admin1", password=self.PASSWORD, totp="000000"),
+            "locked")
+
+    def test_a_refused_sign_in_issues_no_session_cookie(self) -> None:
+        self.post_login(username="admin1", password="wrong-password", totp="000000")
+        names = {c.name for c in self.jar}
+        self.assertNotIn(self.server_mod.COOKIE_NAME, names,
+                         "a failed sign-in issued a session cookie")
+
+    def test_the_right_credentials_still_sign_in(self) -> None:
+        """The negative control: the fix must not refuse valid sign-ins."""
+        resp = self.post_login(username="admin1", password=self.PASSWORD,
+                               totp=totp_at(self.secret))
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.geturl(), self.base + "/")
 
 
 class TestRelaxedControls(unittest.TestCase):

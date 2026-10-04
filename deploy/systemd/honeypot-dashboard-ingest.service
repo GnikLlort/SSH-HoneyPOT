@@ -1,0 +1,52 @@
+[Unit]
+Description=Ingest a honeypot export bundle into the monitoring store
+Documentation=file:/opt/honeypot-dashboard/pkg/docs/16-dashboard-setup.md
+# The dashboard and ingestion are separate programs on purpose: the web
+# process cannot trigger ingestion, has no endpoint for it, and imports
+# nothing from ingest.py (docs/15 §3).
+
+[Service]
+Type=oneshot
+User=hpmon
+Group=hpmon
+Environment=HONEYPOT_STATE_DIR=/opt/honeypot-dashboard
+Environment=TZ=UTC
+WorkingDirectory=/opt/honeypot-dashboard
+# --bundle is a directory that has been unpacked from the bundle tarball; see
+# docs/16 §3 for the fetch step that puts it there. ingest.py removes the
+# bundle's contents after a successful ingest (it keeps them if ingestion
+# fails, so nothing is lost to a transient error).
+ExecStart=/usr/bin/python3 /opt/honeypot-dashboard/pkg/dashboard/ingest.py \
+    --store /var/lib/honeypot-store \
+    --bundle /var/spool/honeypot-export
+
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=600
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# Ingestion reads local files and writes local files. It has no reason to open
+# a network socket either, and the unit says so.
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+ReadWritePaths=/var/lib/honeypot-store /var/spool/honeypot-export
+ReadOnlyPaths=/opt/honeypot-dashboard

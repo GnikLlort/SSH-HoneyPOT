@@ -1,0 +1,17 @@
+[Unit]
+Description=Ship a dashboard export bundle every 15 minutes
+# NOT enabled by install.sh. Enabling this timer is the deliberate step that
+# points the honeypot's evidence at a monitoring host; see docs/16.
+#
+#   sudo systemctl enable --now cowrie-bundle-ship.timer
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+RandomizedDelaySec=120
+AccuracySec=30s
+Persistent=true
+Unit=cowrie-bundle-ship.service
+
+[Install]
+WantedBy=timers.target

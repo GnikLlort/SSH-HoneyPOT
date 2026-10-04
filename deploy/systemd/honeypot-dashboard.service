@@ -1,0 +1,73 @@
+[Unit]
+Description=Honeypot monitoring dashboard (off-host reviewer)
+Documentation=file:/opt/honeypot-dashboard/pkg/docs/15-monitoring-dashboard.md
+Documentation=file:/opt/honeypot-dashboard/pkg/docs/16-dashboard-setup.md
+After=network-online.target
+# This unit belongs on the MONITORING host, never on the honeypot: staging the
+# reviewer beside the thing it reviews defeats the separation (docs/15 §1).
+
+[Service]
+Type=simple
+User=hpmon
+Group=hpmon
+Environment=HONEYPOT_STATE_DIR=/opt/honeypot-dashboard
+Environment=TZ=UTC
+
+# UNIX socket, not TCP. The socket is mode 0660 and lives in a runtime
+# directory only root and the service group can enter; reach it with
+# `socat` over an SSM port-forwarding session, or a VPN (docs/16 §4).
+ExecStart=/usr/bin/python3 /opt/honeypot-dashboard/pkg/dashboard/server.py \
+    --store /var/lib/honeypot-store \
+    --listen unix:/run/honeypot-dashboard/dashboard.sock
+
+RuntimeDirectory=honeypot-dashboard
+RuntimeDirectoryMode=0750
+Restart=on-failure
+RestartSec=5
+
+# --- sandbox ---------------------------------------------------------------
+# RestrictAddressFamilies=AF_UNIX is structural, not policy: with it the
+# process cannot open a network socket at all, so it cannot reach the honeypot
+# even if someone later adds code that tries. Do not add AF_INET to reach the
+# user interface over TCP -- override the listen spec instead and read the note
+# in docs/16, which explains exactly what that gives up.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# The store is writable because the admin, session, audit and export tables
+# live in the same database as the evidence tables, and the web process is the
+# only writer of those four. The evidence tables themselves are opened through
+# a read-only SQLite handle (mode=ro + PRAGMA query_only), so a write to them
+# fails in the driver rather than depending on this unit's restraint.
+ReadWritePaths=/var/lib/honeypot-store
+ReadOnlyPaths=/opt/honeypot-dashboard
+
+# Rendering a recording costs several times its size in memory; the server
+# bounds that itself (8 MB per recording, 4 at once). These are the backstop.
+MemoryMax=1G
+CPUQuota=50%
+TasksMax=128
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=honeypot-dashboard

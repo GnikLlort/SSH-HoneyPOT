@@ -12,6 +12,7 @@ Every change is written to the audit trail, attributed to the actor given by
 --actor (default "cli"), so a change made out of band still appears in the
 record alongside logins, searches and exports.
 
+    python3 manage.py --store /var/lib/honeypot-store init
     python3 manage.py --store /var/lib/honeypot-store adduser --username alice \\
         --role analyst
     python3 manage.py --store /var/lib/honeypot-store list
@@ -23,7 +24,14 @@ record alongside logins, searches and exports.
 
 `adduser` and `passwd` prompt for the password rather than taking it as an
 argument: a password in argv is visible in the process table and in shell
-history.
+history. When there is no terminal to prompt on -- a provisioning script, an
+SSM run-command, a container build -- pass `--password-stdin` and write the
+password to stdin instead. There is deliberately no `--password` flag.
+
+`init` creates an empty store. The dashboard will not start without one, and
+the first real store is normally created by `ingest.py` running over the first
+bundle; `init` exists so an account can be created before any evidence has
+arrived, which is what a fresh monitoring host actually looks like.
 """
 
 from __future__ import annotations
@@ -44,15 +52,53 @@ from store import Store  # noqa: E402
 MIN_PASSWORD_LENGTH = 12
 
 
+def read_password_stdin() -> str:
+    """
+    One password, read from stdin.
+
+    Used by --password-stdin so an account can be created without a terminal.
+    The value is not echoed and not confirmed: there is nothing to echo onto,
+    and a typo is caught when the operator logs in (or by `passwd`).
+    """
+    line = sys.stdin.readline()
+    if not line.strip():
+        print("error: --password-stdin was given but stdin was empty",
+              file=sys.stderr)
+        raise SystemExit(2)
+    return line.rstrip("\r\n")
+
+
 def prompt_password(confirm: bool = True) -> str:
+    # Without this check, getpass falls back to reading stdin and, when that
+    # stdin is closed or exhausted, raises a bare EOFError with a traceback --
+    # which is what a first-time install looked like when the reader ran
+    # `adduser` from anything other than an interactive shell. A missing
+    # terminal is a normal situation with a one-line answer, not a crash.
+    if not sys.stdin.isatty():
+        print("error: cannot prompt for a password: stdin is not a terminal.\n"
+              "       Run this in an interactive session (an SSH or SSM Session\n"
+              "       Manager shell), or pass --password-stdin and pipe the password\n"
+              "       in:\n"
+              "         printf '%s\\n' \"$DASHBOARD_PASSWORD\" | python3 manage.py \\\n"
+              "             --store <store> adduser --username <name> --password-stdin",
+              file=sys.stderr)
+        raise SystemExit(2)
     for _ in range(3):
-        first = getpass.getpass("New password: ")
+        try:
+            first = getpass.getpass("New password: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\naborted: no password was read", file=sys.stderr)
+            raise SystemExit(2)
         problems = password_strength_problems(first)
         if problems:
             print("  rejected: " + ", ".join(problems), file=sys.stderr)
             continue
         if confirm:
-            second = getpass.getpass("Repeat password: ")
+            try:
+                second = getpass.getpass("Repeat password: ")
+            except (EOFError, KeyboardInterrupt):
+                print("\naborted: no password was read", file=sys.stderr)
+                raise SystemExit(2)
             if first != second:
                 print("  the passwords do not match", file=sys.stderr)
                 continue
@@ -84,14 +130,21 @@ def main() -> int:
     ap.add_argument("--issuer", default="Honeypot Dashboard")
     sub = ap.add_subparsers(dest="command", required=True)
 
+    p_init = sub.add_parser("init", help="create an empty store and exit")
+
     p_add = sub.add_parser("adduser", help="create an administrator")
     p_add.add_argument("--username", required=True)
     p_add.add_argument("--role", choices=ROLES, default="viewer")
+    p_add.add_argument("--password-stdin", action="store_true",
+                       help="read the password from stdin instead of prompting "
+                            "(for provisioning; still never argv)")
 
     p_list = sub.add_parser("list", help="list administrators")
 
     p_pw = sub.add_parser("passwd", help="set a password")
     p_pw.add_argument("--username", required=True)
+    p_pw.add_argument("--password-stdin", action="store_true",
+                      help="read the password from stdin instead of prompting")
 
     p_role = sub.add_parser("role", help="change a role")
     p_role.add_argument("--username", required=True)
@@ -119,9 +172,24 @@ def main() -> int:
     args = ap.parse_args()
 
     store_root = Path(args.store)
+
+    # `init` is the one command that must work when no store exists yet: it is
+    # how you get one on a monitoring host that has not received a bundle.
+    if args.command == "init":
+        existed = (store_root / "store.sqlite3").is_file()
+        Store(store_root)
+        print(("store already present at " if existed else "store created at ")
+              + f"{store_root}/store.sqlite3\n"
+              f"next: create the first account:\n"
+              f"  python3 manage.py --store {store_root} adduser "
+              f"--username <name> --role admin")
+        return 0
+
     if not (store_root / "store.sqlite3").is_file():
         print(f"error: no store at {store_root}/store.sqlite3\n"
-              f"       run ingest.py first, or pass --store.", file=sys.stderr)
+              f"       create one with: python3 manage.py --store {store_root} init\n"
+              f"       (or run ingest.py over a bundle, which creates it too)",
+              file=sys.stderr)
         return 2
 
     store = Store(store_root)
@@ -132,7 +200,8 @@ def main() -> int:
             if auth.get_user(args.username):
                 print(f"error: user {args.username} already exists", file=sys.stderr)
                 return 2
-            password = prompt_password()
+            password = (read_password_stdin() if args.password_stdin
+                        else prompt_password())
             secret = auth.create_user(args.username, password, args.role,
                                       actor=args.actor)
             print(f"created {args.username} with role {args.role}")
@@ -153,7 +222,8 @@ def main() -> int:
                       f"{u['last_login'] or '-'}")
 
         elif args.command == "passwd":
-            password = prompt_password()
+            password = (read_password_stdin() if args.password_stdin
+                        else prompt_password())
             auth.set_password(args.username, password, actor=args.actor)
             print(f"password updated for {args.username}; existing sessions revoked")
 

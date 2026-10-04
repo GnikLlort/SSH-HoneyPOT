@@ -216,7 +216,14 @@ class TestShellGuard(GuardTestCase):
                     continue
                 findings.append(f"{script.relative_to(ROOT)}: {stripped}")
         self.assertEqual(
-            findings, ["deploy/uninstall.sh: rm -rf \"$RESOLVED_STATE_DIR\""],
+            findings,
+            ["deploy/uninstall.sh: rm -rf \"$RESOLVED_STATE_DIR\"",
+             # ops/export_bundle.sh deletes its own staging directory. The case
+             # statement immediately above that line proves the path is
+             # <staging>/<UTC stamp> and refuses anything else; the staging
+             # directory is the only thing this script writes, and it never
+             # touches var/log or var/lib.
+             'ops/export_bundle.sh: rm -rf "$OUT"'],
             "a new recursive delete appeared; give it a guard or explain it here")
 
 

@@ -28,6 +28,8 @@ each claim of "verified correct" was tested or traced into the Cowrie source.
 | F-12 | Medium | A session with several recordings showed only one of them | **Fixed** |
 | F-13 | Info | The `shared/` fallback path was one nothing creates | **Fixed** |
 | F-14 | Low | `deploy/install.sh` was not executable | **Fixed** |
+| F-15 | Medium | Every rejected sign-in answered HTTP 500 | **Fixed** |
+| F-16 | Low | The installer aborted on its second run (the update path) | **Fixed** |
 
 Two findings are high severity. Both were found by executing the code against
 hostile input, not by reading it. One of them (F-02) was introduced by this
@@ -41,6 +43,14 @@ each has its own section below with the fix and the tests that guard it, and
 delete guards and the isolation invariant, and the recommendation at the end of
 §6 — assert `forward_redirect`/`forward_tunnel` in the conformance suite — is
 now a check that fails the suite.
+
+**Two more findings, from using it rather than reading it (F-15, F-16).** Both
+came out of following the documentation on a real install: the first sign-in
+that failed returned an HTTP 500 instead of the reason, and the second run of
+the installer — the documented update path — aborted in the middle of the
+build. Neither was reachable by the tests as written, because no test signed in
+*wrongly* and no test ran the installer twice. Both now have regression tests
+that were checked against the pre-fix code.
 
 Section 4 lists the claims that were tested and found **sound**, which matters
 as much as the findings: several of them are the controls the whole design
@@ -661,6 +671,101 @@ command in the docs.
 
 ---
 
+### F-15 — Every rejected sign-in answered HTTP 500 — MEDIUM — FIXED
+
+**Found by:** installing the dashboard as a first-time operator and mistyping
+the authenticator code: the browser said "Something went wrong" and nothing
+else, and the service log said
+`AttributeError: 'Response' object has no attribute 'encode'`.
+
+**What happens.** `_do_login` catches `AuthError` — the exception every
+rejection raises: wrong password, unknown account, bad or missing TOTP, locked
+account — and renders the login page with the reason. It did so as:
+
+```python
+self._send(html_response(self._login_page(error=str(exc)), status=401))
+```
+
+`_login_page` **already returns a `Response`** (it has to: it sets the per-render
+CSRF cookie on the same response). `html_response` takes a *string* and calls
+`.encode("utf-8")` on it, so the error path raised `AttributeError`, which was
+caught by the generic handler and turned into a 500 with an opaque reference id.
+
+**Impact.** Every failed sign-in on every deployment reported an internal error
+instead of the reason. The audit trail was correct throughout — `login.failed`,
+`login.locked` and `login.mfa_failed` rows were written by `auth.login` — so
+the failure was recorded properly and reported to nobody. Two practical
+consequences: an administrator who mistyped a password was pushed towards
+suspecting the install rather than their typing, and a **locked** account
+(15-minute, account-keyed) could not be told apart from a broken one, which is
+precisely when an operator reaches for the wrong fix.
+
+**Fix applied.** Pass the page directly:
+
+```python
+self._send(self._login_page(error=str(exc), status=401))
+```
+
+**Why no earlier test caught it.** The HTTP tests covered the CSRF refusals
+(403), the happy path (303) and the filter errors (400). None of them ever
+signed in *wrongly*, so the one branch that renders a rejection over HTTP was
+never executed. A comment in `_login_page`'s docstring says it returns a
+`Response`; nothing enforced it.
+
+Tests: `TestRejectedLogin` (7) — wrong password, unknown account, bad TOTP,
+missing TOTP and a locked account each return 401 with the reason (and not
+"Something went wrong"), a refused sign-in issues no session cookie, and the
+valid credentials still sign in. The suite was run against the pre-fix line
+reinstated: **5 of the 7 fail**, so the guard is load-bearing rather than
+decorative.
+
+---
+
+### F-16 — The installer aborted on its second run — LOW — FIXED
+
+**Found by:** running the update procedure the documentation describes.
+
+**What happens.** Stage 4 of `deploy/install.sh` was:
+
+```bash
+act "clone the pinned commit into a build directory" \
+    git clone --quiet "$COWRIE_REPO" "$BUILD_DIR/cowrie"
+```
+
+On a host that already has the build clone, `git clone` exits 128
+(`destination path 'cowrie' already exists and is not an empty directory`), and
+`set -e` aborts the installer with no further stages. The header of the same
+script says it "is written to be safe to re-run", and re-running it is the
+documented update path — so an update stopped in the middle of the build and
+looked like a crash. `docs/11` §6 compounded it by telling the operator to
+`git -C /opt/cowrie/share/pkg pull`: that directory is an `rsync` copy with
+`.git` excluded, so it is not a checkout that can be pulled at all.
+
+**Impact.** No unsafe state and no evidence loss — the abort happens before
+anything is replaced. The cost is that the only supported way to move a sensor
+to a new commit or branch did not work, and the failure mode was a `git` error
+in a stage whose purpose is not obvious from the message.
+
+**Fix applied.** The checkout is delegated to `deploy/lib/checkout.sh`
+(`ensure_pinned_checkout`): clone if absent, otherwise fetch and re-resolve the
+commit, discard local edits in the *build* directory with a printed warning,
+force a detached checkout, and verify `HEAD` is the requested commit. An
+existing directory that is not a checkout is never deleted: without `--force` it
+is left alone, and with `--force` it is renamed aside, because "delete this path
+that arrived in a variable" is the operation the delete guards exist to prevent.
+
+Documentation was corrected with it: `docs/17` is the update procedure, and
+`docs/11` §6 no longer tells anyone to pull a directory that is not a
+repository.
+
+Tests: `tests/test_deployment_scripts.py::TestPinnedCheckout` (6) — a fresh
+clone, **the same call twice** (the regression), a commit added after the first
+clone, local edits being discarded with a warning, an unknown commit failing
+loudly, and a non-checkout directory being refused and preserved. The
+double-call test is the one that fails against the old `git clone` line.
+
+---
+
 ## 3. What was verified as correct
 
 These were tested or traced to a source of truth. They are the claims the design
@@ -782,6 +887,8 @@ describes provides false assurance, so this was checked rather than assumed.
 | `TestBundleBuilderGuard` (1) | F-03: the bundle builder refuses a directory that is not a bundle |
 | `TestShippedScriptModes` (2) | F-14: a script the docs tell the reader to run is executable; `lib/` scripts, which are sourced, are exempt |
 | `TestSharedLibraryResolution` (3) | F-13: no shipped module names a path the installer never creates; the state-directory fallback resolves `shared/`; with neither candidate the failure is explicit |
+| `TestRejectedLogin` (7) | F-15: wrong password, unknown account, bad TOTP, missing TOTP and a locked account each answer 401 with the reason; no session cookie on a refusal; valid credentials still sign in |
+| `TestManageProvisioningCli` (7) | The first account on a fresh host: `init` before any bundle (and twice), `adduser --password-stdin`, a weak password refused, an empty stdin refused, no TTY explained, `passwd --password-stdin` revoking sessions, and a command with no store naming `init` |
 | `TestIsolationConfig` (3) | The §6 recommendation: the shipped config keeps `forward_redirect`/`forward_tunnel` false, and the check catches a reopened forward (negative control) |
 
 `tests/test_conformance.py` — one new check, `[isolation] forwarding answered
@@ -908,3 +1015,37 @@ One thing these passes did **not** re-derive: the audit's own measurements
 repeated. The code changed around them, so they remain the numbers for the
 pre-fix code; the fix's own tests assert behaviour (the read does not happen, the
 slot is released) rather than memory figures.
+
+### Third pass — the dashboard as a new operator would meet it
+
+F-15 and F-16 were found by installing the dashboard onto a host that had
+nothing on it and following the documentation, which is a different exercise
+from driving the modules in-process. The full run:
+
+```
+deploy/install-dashboard.sh --apply      (dry run, then apply: account, dirs,
+                                          package copy, units, store, ingest)
+manage.py --store <store> adduser ...    (first account, TOTP enrolment)
+server.py --listen unix:...              (installed copy, as the service account)
+GET /login  200                          POST /login (wrong code) -> was 500, now 401
+POST /login (right code)                 -> 303, session issued
+GET /, /session/<sensor>/<id>            -> 200, recording player renders
+```
+
+| Suite | Result |
+|---|---|
+| `tests/test_conformance.py` (live lab, `127.0.0.1:2222`) | **197 / 198**, 0 actionable failures |
+| `tests/test_dashboard.py` | **95 / 95** (81 before F-15's `TestRejectedLogin` and the new `TestManageProvisioningCli`) |
+| `tests/test_playback.py` | **32 / 32** |
+| `tests/test_safety_guards.py` | **31 / 31** |
+| `tests/test_deployment_scripts.py` | **22** (21 pass, 1 skipped: the honeypot-host probe needs root) |
+| `deploy/update.sh --ref main` (dry run, on a host that is not installed) | exit 1 with "not an installed honeypot" — the refusal, not a stack trace |
+| `deploy/install-dashboard.sh --apply` end to end | exit 0; units substituted; store created; account created; sign-in verified over a UNIX socket |
+| `manage.py init` / `adduser --password-stdin` / a weak password / an empty stdin / no TTY | 0, 0, 2, 2, 2 — the last with an explanation instead of an `EOFError` traceback |
+
+Two limits of this pass, stated so the numbers are not read as more than they
+are: the units were written and syntax-verified (`systemd-analyze verify`), but
+this machine has no systemd bus, so nothing was *started* by systemd — the
+dashboard was run directly as the service account instead. And the bundle
+shipper's S3 upload was not exercised against a real bucket; it was exercised
+up to the archive and its hash.

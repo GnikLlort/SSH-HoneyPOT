@@ -34,12 +34,25 @@ under its own SHA-256 so a file renamed or truncated in transit is detected
 rather than indexed under the wrong name. `ingest.py` is the monitoring-side
 half, and it is the only writer of the evidence tables.
 
+`ops/export_bundle.sh` is the deployment wrapper around `bundle.py`: it builds
+the bundle, tars it, hashes the archive, uploads it to the evidence bucket
+under `<prefix>/<sensor>/bundles/<stamp>/`, and clears its own staging.
+`install.sh` installs it and the `cowrie-bundle-ship.timer` beside it, but
+enables neither — an off-host reviewer is a decision, and `docs/16` §2 is where
+you make it.
+
 ---
 
 ## 2. Running it
 
+**Read `docs/16` for the full procedure.** The order below is the one that
+works, and the order matters: there must be a store before there can be an
+account, and `manage.py init` is what creates one when no bundle has arrived
+yet.
+
 ```bash
 # on the monitoring host, from the repository root
+python3 dashboard/manage.py --store /var/lib/honeypot-store init
 python3 dashboard/manage.py --store /var/lib/honeypot-store adduser \
     --username <you> --role admin            # prints the TOTP secret once
 python3 dashboard/ingest.py \
@@ -47,6 +60,16 @@ python3 dashboard/ingest.py \
 python3 dashboard/server.py \
     --store /var/lib/honeypot-store --listen unix:/run/honeypot-dashboard/dashboard.sock
 ```
+
+`deploy/install-dashboard.sh` does all of the setup on a monitoring host —
+account, package, store, units — and prints the two commands it leaves to you
+(choosing the first password, and reaching the interface). `docs/16` is the
+walkthrough, including how a bundle gets from the honeypot to the spool in the
+first place.
+
+If there is no terminal to prompt on, `adduser` and `passwd` accept
+`--password-stdin` rather than a password in argv; without either they exit 2
+with an explanation instead of raising `EOFError`.
 
 The default bind is loopback (`127.0.0.1:8443`) and the recommended deployment
 is a **UNIX socket**, reached with `socat` over an SSM port-forwarding session or

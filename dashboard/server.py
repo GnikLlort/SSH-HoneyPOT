@@ -600,7 +600,12 @@ class Handler(BaseHTTPRequestHandler):
                 username, password, totp, src_ip=src_ip,
                 user_agent=self.headers.get("User-Agent", ""))
         except AuthError as exc:
-            self._send(html_response(self._login_page(error=str(exc)), status=401))
+            # _login_page returns a Response, not a string. Wrapping it in
+            # html_response() called .encode() on the Response object, so every
+            # rejected sign-in -- wrong password, unknown account, bad TOTP,
+            # locked account -- became an AttributeError and an HTTP 500
+            # instead of the message telling the administrator what happened.
+            self._send(self._login_page(error=str(exc), status=401))
             return
 
         idle = self.app.auth.idle_timeout
