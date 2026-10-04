@@ -282,6 +282,101 @@ class TestCredentialRedaction(DashboardTestCase):
         self.assertIn("Sunrise-Ledger-1972", row["message"])
 
 
+class TestSanitizerPerformance(DashboardTestCase):
+    """
+    Every sanitizer pattern must be linear in the length of its input.
+
+    This is a security property, not a nicety. The sanitizers run over
+    attacker-controlled text on every page render, and Cowrie accepts a 16 KB
+    command, so a quadratic pattern lets any visitor to the honeypot make the
+    dashboard unusable -- without touching the monitoring host and without
+    leaving a trace anyone would think to look for.
+
+    It has happened once already. A pattern written as
+    `(\\blogin attempt \\[[^\\]\\n]*/)([^\\]\\n]*)(?=\\])` let the first group
+    end at any slash, so a line of slashes with no closing bracket made the
+    engine try every split: measured 22 ms at 2 KB and 1213 ms at 16 KB, growing
+    with the square of the input. The test below fails on that pattern.
+    """
+
+    # A hostile input per shape the patterns key on: long runs of the
+    # characters a pattern looks for, with no terminator, which is what makes
+    # a backtracking engine explore every split point.
+    HOSTILE = {
+        "slashes, no bracket": "login attempt [" + "a/" * 16000,
+        "slashes": "/" * 16384,
+        "pass flags": "-pass " * 2700,
+        "password assignments": "password= " * 1800,
+        "letters": "A" * 16384,
+        "quotes": "\"'" * 8000,
+        "spaces": " " * 16384,
+        "newlines": "a\n" * 8000,
+        "brackets": "[" * 16384,
+        "markers repeated": "login attempt [" * 1000,
+        "curl flags": "curl " + "-x " * 5000,
+        "wget user": "wget " + "--user=a " * 2000,
+        "ssh key": "ssh-rsa " + "A" * 16000,
+    }
+
+    # Per-payload budget. Sized by measurement, not by feel: the current
+    # implementation takes 3 ms on the worst payload here and the quadratic one
+    # took 5400 ms, so 400 ms sits two orders of magnitude above the honest
+    # cost and still fails the regression by more than ten times.
+    BUDGET_S = 0.4
+
+    def test_no_pattern_backtracks_catastrophically(self) -> None:
+        import time
+        worst_name, worst = "", 0.0
+        for name, payload in self.HOSTILE.items():
+            start = time.perf_counter()
+            mask_sensitive(payload)
+            elapsed = time.perf_counter() - start
+            if elapsed > worst:
+                worst_name, worst = name, elapsed
+        self.assertLess(
+            worst, self.BUDGET_S,
+            f"sanitizer took {worst * 1000:.0f} ms on {worst_name!r}; "
+            f"a pattern is backtracking catastrophically")
+
+    def test_growth_is_linear_not_quadratic(self) -> None:
+        """
+        Timing a single input can pass by luck. Doubling the input and checking
+        that the time does not roughly quadruple is what actually distinguishes
+        linear from quadratic.
+        """
+        import time
+
+        def cost(n: int) -> float:
+            payload = "login attempt [" + "a/" * n
+            best = min(
+                (self._timed(mask_sensitive, payload) for _ in range(3)))
+            return best
+
+        small = cost(4000)
+        large = cost(16000)          # 4x the input
+        # Linear would be ~4x, quadratic ~16x. 8x is comfortably between.
+        if small < 0.0002:           # below the clock's useful resolution
+            self.skipTest("timings below the measurement floor")
+        self.assertLess(large / small, 8.0,
+                        f"4x the input cost {large / small:.1f}x the time")
+
+    @staticmethod
+    def _timed(fn, *args) -> float:
+        import time
+        start = time.perf_counter()
+        fn(*args)
+        return time.perf_counter() - start
+
+    def test_long_recording_still_masks(self) -> None:
+        """Bounding the quantifiers must not quietly stop masking."""
+        for payload in ("login attempt [deploy/Sunrise-Ledger-1972] succeeded",
+                        "login attempt [root/toor] failed",
+                        "login attempt [deploy/] succeeded"):
+            with self.subTest(payload=payload):
+                self.assertNotIn("Sunrise-Ledger-1972", mask_sensitive(payload))
+                self.assertNotIn("toor", mask_sensitive(payload))
+
+
 # ----------------------------------------------------------------------
 # Ingestion
 # ----------------------------------------------------------------------
@@ -375,6 +470,76 @@ class TestRecordingJoinKey(DashboardTestCase):
         stats = self.ingest()
         self.assertTrue(stats.errors, "a recording altered in transit was accepted")
         self.assertFalse(list((self.store_root / "recordings").iterdir()))
+
+
+class TestHeaderInjection(DashboardTestCase):
+    """
+    A header value containing CR or LF lets whoever controls it write the rest
+    of the response.
+
+    This was reachable: /export built `Content-Disposition` from a form field
+    truncated to 32 characters, and http.server writes header values verbatim.
+    A 32-character field is ample room for `\\r\\nContent-Type: text/html\\r\\n\\r\\n`
+    plus a script tag, which splits the response and lets the attacker set the
+    beginning of the body. Reproduced against a running instance before the
+    fix.
+    """
+
+    def test_line_breaks_are_refused(self) -> None:
+        from server import invalid_header
+        bad = [
+            ("Content-Disposition", 'attachment; filename="a\r\nX-Injected: 1"'),
+            ("Content-Disposition", 'attachment; filename="a\nX-Injected: 1"'),
+            ("X\r\nY", "value"),
+            ("X", "value\r\n"),
+            ("", "value"),
+            ("X:Y", "value"),
+        ]
+        for key, value in bad:
+            with self.subTest(key=key, value=value[:30]):
+                self.assertTrue(invalid_header(key, value),
+                                f"accepted a header that splits the response: {key!r}")
+
+    def test_ordinary_headers_are_allowed(self) -> None:
+        from server import invalid_header
+        for key, value in (("Content-Type", "text/csv; charset=utf-8"),
+                           ("Content-Disposition",
+                            'attachment; filename="honeypot-events-20260101T000000Z.csv"'),
+                           ("Content-Length", "4096")):
+            with self.subTest(key=key):
+                self.assertEqual(invalid_header(key, value), "")
+
+    def test_non_latin1_is_refused_before_the_status_line(self) -> None:
+        """http.server encodes headers as latin-1; raising mid-response would
+        leave a half-written reply on the wire."""
+        from server import invalid_header
+        self.assertTrue(invalid_header("X-Test", "caf\u00e9 \u2603"))
+
+    def test_filename_allowlist(self) -> None:
+        from server import safe_filename
+        cases = {
+            'evil"\r\nX: 1': "evilX1",
+            "../../etc/passwd": "etcpasswd",
+            "honeypot-events-20260101T000000Z.csv":
+                "honeypot-events-20260101T000000Z.csv",
+            "": "download",
+            "---": "download",
+            "a" * 500: "a" * 96,
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw[:24]):
+                got = safe_filename(raw)
+                self.assertEqual(got, expected)
+                self.assertFalse(any(c in got for c in '\r\n"/\\'))
+
+    def test_kind_is_allowlisted_not_truncated(self) -> None:
+        """
+        The export must pick its branch from a fixed set. Truncation is not a
+        sanitiser.
+        """
+        src = (ROOT / "dashboard" / "server.py").read_text(encoding="utf-8")
+        self.assertIn('if kind not in ("events", "sessions", "transfers")', src,
+                      "the export kind is no longer allowlisted")
 
 
 # ----------------------------------------------------------------------

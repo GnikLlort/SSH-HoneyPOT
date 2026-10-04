@@ -284,18 +284,49 @@ class Handler(BaseHTTPRequestHandler):
         ]
 
     def _send(self, response: Response) -> None:
-        self.send_response(response.status)
-        self.send_header("Content-Type", response.ctype)
-        self.send_header("Content-Length", str(len(response.body)))
-        for key, value in self._security_headers():
-            self.send_header(key, value)
+        headers = [
+            ("Content-Type", response.ctype),
+            ("Content-Length", str(len(response.body))),
+            *self._security_headers(),
+        ]
         if not self.allow_framing:
-            self.send_header("X-Frame-Options", "DENY")
-        for key, value in response.headers:
+            headers.append(("X-Frame-Options", "DENY"))
+        headers.extend(response.headers)
+
+        # Validate the whole header block BEFORE the status line is written.
+        #
+        # http.server writes a header value verbatim, so a value containing a
+        # line break splits the response: everything after the break is parsed
+        # by the client as another header, and a bare CRLF ends the header block
+        # early so the rest of the value becomes the body. That was reachable
+        # here through the export filename, which was built from a form field
+        # (see _export). Checking centrally means the next person to add a
+        # dynamic header inherits the protection instead of rediscovering the
+        # problem.
+        for key, value in headers:
+            problem = invalid_header(key, value)
+            if problem:
+                sys.stderr.write(
+                    f"[dashboard] refusing to send a malformed header: {problem}\n")
+                self._send_bare_error(500)
+                return
+
+        self.send_response(response.status)
+        for key, value in headers:
             self.send_header(key, value)
         self.end_headers()
         if self.command != "HEAD" and response.body:
             self.wfile.write(response.body)
+
+    def _send_bare_error(self, status: int) -> None:
+        """Minimal response used when the intended one cannot be sent safely."""
+        body = b"internal error\n"
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
 
     # -- request context ---------------------------------------------------
     def _principal(self):
@@ -1194,7 +1225,15 @@ role has any.
         except PermissionDenied as exc:
             return html_response(self._forbidden(principal, str(exc)), status=403)
 
-        kind = (form.get("kind") or "events")[:32]
+        # Allowlisted, not truncated. `kind` reaches the filename in the
+        # Content-Disposition header, and a truncation is not a sanitiser: 32
+        # characters of form data is ample room for a CRLF and the beginning of
+        # a new response. The data branch below is constrained either way, but
+        # the header is not, so the value itself has to be one of three known
+        # strings.
+        kind = (form.get("kind") or "events").strip().lower()
+        if kind not in ("events", "sessions", "transfers"):
+            kind = "events"
         fmt = (form.get("fmt") or "csv")[:8]
         if fmt not in ("csv", "json"):
             fmt = "csv"
@@ -1222,7 +1261,10 @@ role has any.
                 columns.insert(7, "password")
 
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        filename = f"honeypot-{kind}-{stamp}.{fmt}"
+        # safe_filename is belt to the allowlist's braces: the value above is
+        # already one of three constants, and this makes that true by
+        # construction if the line is ever edited.
+        filename = safe_filename(f"honeypot-{kind}-{stamp}.{fmt}")
 
         if fmt == "json":
             payload = {
@@ -1288,6 +1330,41 @@ role has any.
         except Exception:  # noqa: BLE001
             self._send(Response(b"internal error\n", status=500,
                                 ctype="text/plain; charset=utf-8"))
+
+
+def invalid_header(key: object, value: object) -> str:
+    """
+    Return why a header cannot be sent, or "" if it is fine.
+
+    A header value that contains CR or LF lets whoever controls it write the
+    rest of the response. Nothing in this program may place such a value on the
+    wire, so the check is central and the answer is to refuse the request, not
+    to strip the characters: silently repairing a header produces a response
+    nobody reasoned about.
+    """
+    key, value = str(key), str(value)
+    if not key or any(c in key for c in "\r\n:"):
+        return f"malformed header name {key!r}"
+    if any(c in value for c in "\r\n"):
+        return f"value of {key!r} contains a line break"
+    try:
+        value.encode("latin-1")
+    except UnicodeEncodeError:
+        # http.server encodes headers as latin-1 and would raise mid-response.
+        return f"value of {key!r} is not latin-1 encodable"
+    return ""
+
+
+def safe_filename(name: str, fallback: str = "download") -> str:
+    """
+    Reduce a name to something that is safe in a Content-Disposition header.
+
+    The allowlist is deliberately tiny: a filename assembled from these
+    characters cannot carry a quote, a line break, or a path separator.
+    """
+    cleaned = "".join(c for c in str(name) if c.isalnum() or c in "._-")
+    cleaned = cleaned.strip(".-")
+    return cleaned[:96] or fallback
 
 
 class UnixHTTPServer(ThreadingHTTPServer):

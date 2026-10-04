@@ -83,9 +83,25 @@ SENSITIVE_PATTERNS: list[re.Pattern[str]] = [
     # The trailing bracket is a lookahead rather than a captured group so the
     # pattern has exactly two groups, which is what the replacer below expects,
     # and so the username stays visible -- it is useful and already logged
-    # separately. `[^\]]*` rather than `\S+` so a password containing a space
-    # is masked whole.
-    re.compile(r"(?i)(\blogin attempt \[[^\]\n]*/)([^\]\n]*)(?=\])"),
+    # separately. The password class is `[^\]\n]` rather than `\S+` so a
+    # password containing a space is masked whole.
+    #
+    # EVERY QUANTIFIER HERE IS BOUNDED, AND THAT IS NOT COSMETIC.
+    #
+    # The obvious spelling of this pattern is
+    #     (\blogin attempt \[[^\]\n]*/)([^\]\n]*)(?=\])
+    # and it is quadratic: `[^\]\n]*/` can end at any slash, so a line with many
+    # slashes and no closing bracket makes the engine try every split. Measured
+    # on this machine, in the version of this file that shipped it: 22 ms for
+    # 2 KB, 85 ms for 4 KB, 334 ms for 8 KB, 1213 ms for 16 KB -- doubling the
+    # input quadrupling the time. Cowrie accepts a 16 KB command, and any
+    # visitor can type one, so a few hundred well-chosen commands could make
+    # every page of the dashboard take minutes to render.
+    #
+    # The username class excludes the slash, which removes the ambiguity
+    # outright; the bounds are the belt to that braces, and cap the work per
+    # marker at 64 x 256 steps no matter what arrives.
+    re.compile(r"(?i)(\blogin attempt \[[^/\]\n]{0,64}/)([^\]\n]{0,256})(?=\])"),
     # Cowrie's own wording for a failed authentication, when a sensor or a
     # older version spells it out instead of using the bracket form.
     re.compile(r"(?i)(\b(?:authentication|login) (?:attempt|failed) for [^\s/]+/)(\S+)"),
