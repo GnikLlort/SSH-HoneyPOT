@@ -302,7 +302,13 @@ about someone else's data, not a configuration preference, and it belongs in
 
 **`forward_redirect` / `forward_tunnel`.** Enabling either makes the honeypot a
 proxy to a real destination. That directly contradicts the isolation
-requirement, so it is documented as forbidden rather than offered as a knob.
+requirement, so it is documented as forbidden rather than offered as a knob, and
+**now asserted by a test**: `tests/test_conformance.py` reads this file and fails
+the suite if either value is anything but `false`
+(`tests/lib/config_check.py`, also run by `tests/test_safety_guards.py`). The
+distinction matters — `forwarding = true` is safe only while those two stay
+false, so the safety of the deployment rested on two values that nothing
+previously read.
 
 **Auto-banning on connection.** There is no rule, anywhere, that blocks or
 reports an IP merely for connecting to the honeypot. The honeypot exists to

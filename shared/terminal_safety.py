@@ -183,8 +183,16 @@ def safe_html(raw: str, mask: bool = True, limit: int = 0) -> str:
     This is the only function that should be used to put attacker-controlled
     text into HTML. Note that the renderer still uses textContent wherever
     possible; escaping is the second line of defence, not the first.
+
+    Backticks are escaped as well, which html.escape() does not do. Every
+    attribute in this codebase is quoted, so a backtick is inert as written --
+    but in HTML5 a *unquoted* attribute value terminated by a backtick breaks
+    out, so this is the one character an author could forget. Escaping it
+    centrally is the same reasoning as the header check in server.py: the next
+    person to add markup inherits the protection instead of rediscovering it.
     """
-    return html.escape(safe_text(raw, mask=mask, limit=limit), quote=True)
+    escaped = html.escape(safe_text(raw, mask=mask, limit=limit), quote=True)
+    return escaped.replace("`", "&#96;")
 
 
 def safe_field(raw: object, mask: bool = True, limit: int = 256) -> str:

@@ -31,7 +31,11 @@ DELIBERATELY ABSENT
       creates or resets accounts out of band, and that action is audited.
     * No API tokens. They would outlive the session controls.
     * No fallback that skips MFA. `--demo-mode` exists for local
-      demonstrations and refuses to be combined with a non-loopback bind.
+      demonstrations. It is refused on a non-loopback bind unless the operator
+      also passes --i-know-this-exposes-monitoring, which is an acknowledgement
+      rather than a safeguard: with both flags, MFA is off on a reachable
+      interface. The startup banner lists that, and every other relaxed
+      control, in one place.
 """
 
 from __future__ import annotations
@@ -351,6 +355,28 @@ class Authenticator:
             conn.execute("DELETE FROM admin_session WHERE username=?", (username,))
         self.audit(actor, "user.password", target=username, role="cli")
 
+    def unlock_user(self, username: str, actor: str = "cli") -> bool:
+        """
+        Clear a lockout without touching the password.
+
+        Five failed logins lock an account for 15 minutes, keyed on the account
+        rather than on the source, so anyone who can reach the login page can
+        keep an administrator locked out indefinitely. Behind SSM or a VPN that
+        needs a foothold on the management path first, but when it happens the
+        recovery must not be "change the password": that is not what an
+        operator guesses at 3 a.m., and it invalidates a credential for no
+        reason. Returns False when there is no such account.
+        """
+        with self.store.connect() as conn:
+            cur = conn.execute(
+                "UPDATE admin_user SET failed_count=0, locked_until=NULL "
+                "WHERE username=?", (username,))
+            if cur.rowcount == 0:
+                return False
+        self.audit(actor, "user.unlock", target=username,
+                   detail="lockout cleared without a password change")
+        return True
+
     def set_role(self, username: str, role: str, actor: str = "cli") -> None:
         if role not in ROLES:
             raise ValueError(f"role must be one of {ROLES}")
@@ -386,7 +412,7 @@ class Authenticator:
 
     # -- login -------------------------------------------------------------
     def login(self, username: str, password: str, totp_code: str,
-              src_ip: str = "") -> tuple[AdminPrincipal, str]:
+              src_ip: str = "", user_agent: str = "") -> tuple[AdminPrincipal, str]:
         """
         Verify credentials and start a session.
 
@@ -394,9 +420,20 @@ class Authenticator:
         display. The message is deliberately vague about *which* factor failed
         for an unknown user, but explicit about MFA for a known one, because an
         administrator who has lost their authenticator needs to know that.
+
+        `user_agent` is bound to the session when supplied: the column existed
+        and was written empty, implying a binding that did not exist (AUDIT
+        F-09). A session presented from a different user agent is destroyed.
         """
         user = self.get_user(username)
         now = time.time()
+        # Bounded housekeeping. Expired rows were otherwise deleted only when
+        # their exact token was presented again, so the table grew for the
+        # lifetime of the process on a long-lived monitoring host.
+        try:
+            self.purge_expired_sessions()
+        except Exception:  # noqa: BLE001 - housekeeping must not block a login
+            pass
 
         if user and user.get("locked_until") and user["locked_until"] > now:
             remaining = int((user["locked_until"] - now) / 60) + 1
@@ -416,8 +453,14 @@ class Authenticator:
 
         if user.get("totp_enabled"):
             if self.demo_mode:
-                # Local demonstration only. The server refuses to combine this
-                # with a non-loopback bind, and prints a warning at startup.
+                # The authenticator step is skipped whenever this flag is set.
+                # The server refuses a non-loopback bind with demo mode UNLESS
+                # the operator also passes --i-know-this-exposes-monitoring, in
+                # which case this runs with MFA disabled on a reachable
+                # interface. Nothing here prevents that; the startup banner
+                # names every relaxed control in one place (see relaxed_controls
+                # in server.py). Do not let a comment imply a check that is not
+                # in the code -- that is how an audit gets a false pass.
                 pass
             elif not verify_totp(user.get("totp_secret") or "", totp_code):
                 self._record_failure(username, user, src_ip)
@@ -438,7 +481,8 @@ class Authenticator:
                        last_seen, idle_expiry, hard_expiry, src_ip, ua_hash)
                    VALUES(?,?,?,?,?,?,?,?,?)""",
                 (hash_token(token), username, user["role"], now, now,
-                 now + self.idle_timeout, now + self.hard_timeout, src_ip, ""))
+                 now + self.idle_timeout, now + self.hard_timeout, src_ip,
+                 hash_token(user_agent[:512]) if user_agent else ""))
         self.audit(username, "login.success", role=user["role"], src_ip=src_ip,
                    detail="mfa=skipped(demo)" if (self.demo_mode and user.get("totp_enabled"))
                    else "mfa=verified")
@@ -464,8 +508,16 @@ class Authenticator:
                               src_ip=src_ip, session_token=token)
 
     # -- session lifecycle -------------------------------------------------
-    def validate_session(self, token: str, touch: bool = True) -> AdminPrincipal | None:
-        """Return the principal for a live session, or None."""
+    def validate_session(self, token: str, touch: bool = True,
+                         user_agent: str = "") -> AdminPrincipal | None:
+        """
+        Return the principal for a live session, or None.
+
+        `user_agent` is compared against the value bound at login. The check is
+        skipped when either side is empty, so sessions that predate the binding
+        keep working and a client that sends no User-Agent is not locked out --
+        the binding adds a signal, it does not become a second password.
+        """
         if not token:
             return None
         now = time.time()
@@ -489,6 +541,15 @@ class Authenticator:
             # immediately rather than at the next login.
             self.destroy_session(token)
             self.audit(row["username"], "session.invalidated", detail="role changed")
+            return None
+        bound_ua = row["ua_hash"] if "ua_hash" in row.keys() else ""
+        if bound_ua and user_agent and not hmac.compare_digest(
+                bound_ua, hash_token(user_agent[:512])):
+            # A session cookie replayed from a different client. Destroy it and
+            # record why: this is the signal that a token has leaked.
+            self.destroy_session(token)
+            self.audit(row["username"], "session.ua_mismatch",
+                       detail="presented from a different user agent; session destroyed")
             return None
         if touch:
             with self.store.connect() as conn:

@@ -105,6 +105,10 @@ def main() -> int:
     p_totp = sub.add_parser("totp", help="reset an authenticator secret")
     p_totp.add_argument("--username", required=True)
 
+    p_unlock = sub.add_parser(
+        "unlock", help="clear a lockout without changing the password")
+    p_unlock.add_argument("--username", required=True)
+
     p_code = sub.add_parser("totp-code",
                             help="print the current code for a secret (enrolment check)")
     p_code.add_argument("--secret", required=True)
@@ -164,6 +168,17 @@ def main() -> int:
         elif args.command == "enable":
             auth.disable_user(args.username, False, actor=args.actor)
             print(f"{args.username} enabled")
+
+        elif args.command == "unlock":
+            # Five failed logins lock an account for 15 minutes, keyed on the
+            # account rather than the source, so anyone who can reach the login
+            # page can keep an administrator locked out. The only command that
+            # used to clear the lock was `passwd`, because it happens to reset
+            # the counter -- not something to guess at 3 a.m.
+            if not auth.unlock_user(args.username, actor=args.actor):
+                print(f"error: no such user: {args.username}", file=sys.stderr)
+                return 2
+            print(f"{args.username} unlocked; the password was not changed")
 
         elif args.command == "totp":
             secret = auth.reset_totp(args.username, actor=args.actor)

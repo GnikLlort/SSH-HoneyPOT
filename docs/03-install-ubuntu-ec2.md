@@ -274,7 +274,7 @@ ordinary discovery commands, and checks that the answers agree with the
 profile. It creates real sessions, so they will appear in the logs and in the
 playback UI — that is expected, and they are useful as a known-good baseline.
 
-Expected result: **196 of 197 checks pass, with zero failures above `info`
+Expected result: **197 of 198 checks pass, with zero failures above `info`
 severity.** The one remaining `info` check is a documented paramiko interop
 quirk; see `docs/09-test-results.md` and `docs/10`.
 

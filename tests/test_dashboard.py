@@ -33,13 +33,22 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import http.cookiejar
 import json
 import os
+import re
 import shutil
+import socket
+import subprocess
 import struct
 import sys
 import tempfile
+import threading
+import time
 import unittest
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -772,6 +781,472 @@ class TestTtylogParser(unittest.TestCase):
     def test_garbage_does_not_raise(self) -> None:
         parse_ttylog_bytes(b"\x00" * 64)
         parse_ttylog_bytes(b"not a ttylog at all")
+
+
+# ----------------------------------------------------------------------
+# Filters that cannot be honoured (AUDIT F-06)
+# ----------------------------------------------------------------------
+
+class TestFilterValidation(DashboardTestCase):
+    """
+    A filter must return what was asked for or fail. It must never widen.
+
+    The previous behaviour was `except ValueError: return None`, which dropped
+    the clause: `since=garbage` returned every event in the store with a page
+    that looked like a successful search, and a search for the literal
+    character `_` matched every row with a non-empty field because `_` is a
+    LIKE wildcard. Both are covered here.
+    """
+
+    def test_unparsable_dates_are_refused(self) -> None:
+        from store import FilterError, _date_bound
+        for bad in ("garbage", "2026-13-45", "2026-07-31T99", "31/07/2026", "2026-7-3"):
+            with self.subTest(value=bad):
+                with self.assertRaises(FilterError):
+                    _date_bound(bad)
+        # Empty still means "no bound", and a valid bound still parses.
+        self.assertIsNone(_date_bound(""))
+        self.assertIsNotNone(_date_bound("2026-07-31"))
+
+    def test_every_query_path_refuses_a_bad_bound(self) -> None:
+        self.ingest()
+        q = Queries(self.store())
+        for call in (lambda: q.events(EventFilter(since="garbage")),
+                     lambda: q.sessions(EventFilter(until="not-a-date")),
+                     lambda: q.transfers(EventFilter(since="2026-99-99"))):
+            with self.assertRaises(Exception) as ctx:
+                call()
+            self.assertIn("not a date", str(ctx.exception))
+
+    def test_a_valid_bound_still_bounds(self) -> None:
+        self.ingest()
+        q = Queries(self.store())
+        same_day = q.events(EventFilter(since="2026-07-31", until="2026-07-31"))[1]
+        later = q.events(EventFilter(since="2026-08-01"))[1]
+        self.assertGreater(same_day, 0)
+        self.assertEqual(later, 0,
+                         "a bound that should exclude every fixture event returned rows")
+
+    def test_like_wildcards_are_literal_characters(self) -> None:
+        self.ingest()
+        q = Queries(self.store())
+        # No fixture field contains a literal underscore or percent sign, so a
+        # literal search returns nothing. Before escaping, `_` matched every
+        # row with a non-empty command, filename, url or username.
+        self.assertEqual(q.events(EventFilter(text="_"))[1], 0)
+        self.assertEqual(q.events(EventFilter(text="%"))[1], 0)
+        self.assertEqual(q.transfers(EventFilter(text="%"))[1], 0)
+
+    def test_literal_search_still_works(self) -> None:
+        self.ingest()
+        q = Queries(self.store())
+        self.assertGreater(q.events(EventFilter(text="deploy"))[1], 0)
+
+    def test_like_escaping_escapes_the_escape_character(self) -> None:
+        from store import _like
+        self.assertEqual(_like("a_b"), "%a\\_b%")
+        self.assertEqual(_like("50%"), "%50\\%%")
+        self.assertEqual(_like(r"c:\\x"), r"%c:\\\\x%")
+
+
+# ----------------------------------------------------------------------
+# Playback bounds (AUDIT F-04)
+# ----------------------------------------------------------------------
+
+class _StubHandler:
+    """Just enough of the request handler to call _session_bundle directly."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    def _client_ip(self) -> str:
+        return "127.0.0.1"
+
+
+class TestPlaybackBounds(DashboardTestCase):
+    """
+    Rendering a recording costs a multiple of its size, and the size is chosen
+    by whoever connected. Two bounds: refuse to read above a display limit, and
+    only render a few at once.
+    """
+
+    def app(self, **kw):
+        import server as server_mod
+        kw.setdefault("demo_mode", True)
+        return server_mod.Dashboard(self.store_root, **kw)
+
+    def bundle_for(self, app, sensor: str, session_id: str, principal=None):
+        import server as server_mod
+        return server_mod.Handler._session_bundle(
+            _StubHandler(app), sensor, session_id, principal)
+
+    def first_session(self) -> tuple[str, str]:
+        self.ingest()
+        rows, _ = Queries(self.store()).sessions(EventFilter(limit=5))
+        for row in rows:
+            if row.get("recording_sha256"):
+                return str(row["sensor"]), str(row["session_id"])
+        self.fail("the fixture has no recorded session")
+
+    def test_oversized_recording_is_described_not_read(self) -> None:
+        sensor, session_id = self.first_session()
+        app = self.app(playback_display_limit=16)  # the fixture recording is 40+ bytes
+        bundle = self.bundle_for(app, sensor, session_id)
+        self.assertTrue(bundle["recorded"])
+        self.assertTrue(bundle["too_large"])
+        self.assertEqual(bundle["chunks"], [])
+        self.assertIn("display limit", bundle["note"])
+        self.assertGreater(bundle["bytes"], 16)
+
+    def test_the_file_is_not_even_opened_when_it_is_too_large(self) -> None:
+        sensor, session_id = self.first_session()
+        app = self.app(playback_display_limit=16)
+        opened: list[str] = []
+        original = Path.read_bytes
+
+        def tracing(self, *a, **kw):
+            opened.append(str(self))
+            return original(self, *a, **kw)
+
+        Path.read_bytes = tracing  # type: ignore[assignment]
+        try:
+            self.bundle_for(app, sensor, session_id)
+        finally:
+            Path.read_bytes = original  # type: ignore[assignment]
+        self.assertEqual(opened, [],
+                         "the recording was read into memory despite exceeding the "
+                         "display limit")
+
+    def test_small_recording_still_renders(self) -> None:
+        sensor, session_id = self.first_session()
+        app = self.app(playback_display_limit=8 * 1024 * 1024)
+        bundle = self.bundle_for(app, sensor, session_id)
+        self.assertTrue(bundle["recorded"])
+        self.assertFalse(bundle["too_large"])
+        self.assertGreater(len(bundle["chunks"]), 0)
+
+    def test_renderer_slots_are_bounded_and_do_not_leak(self) -> None:
+        sensor, session_id = self.first_session()
+        app = self.app(playback_display_limit=8 * 1024 * 1024,
+                       playback_concurrency=1, playback_wait=0.05)
+        # Hold the only slot: the request must be told the renderer is busy
+        # rather than queueing without limit.
+        acquired = app.playback_slots.acquire(timeout=1)
+        self.assertTrue(acquired)
+        try:
+            busy = self.bundle_for(app, sensor, session_id)
+            self.assertTrue(busy["recorded"])
+            self.assertEqual(busy["chunks"], [])
+            self.assertIn("busy", busy["note"])
+        finally:
+            app.playback_slots.release()
+        # Released, so the next render works: a hostile recording that raises
+        # mid-parse must not consume a slot permanently.
+        after = self.bundle_for(app, sensor, session_id)
+        self.assertGreater(len(after["chunks"]), 0)
+
+    def test_a_parse_failure_does_not_leak_a_slot(self) -> None:
+        sensor, session_id = self.first_session()
+        app = self.app(playback_display_limit=8 * 1024 * 1024,
+                       playback_concurrency=1, playback_wait=0.05)
+
+        def boom(*a, **kw):
+            raise ValueError("hostile recording")
+
+        import ttylog
+        original = ttylog.parse_ttylog_bytes
+        # The handler imports the parser inside the function, so patching the
+        # module attribute is what the next call will pick up.
+        ttylog.parse_ttylog_bytes = boom
+        try:
+            with self.assertRaises(ValueError):
+                self.bundle_for(app, sensor, session_id)
+        finally:
+            ttylog.parse_ttylog_bytes = original
+        self.assertTrue(app.playback_slots.acquire(timeout=0.1),
+                        "a failed render leaked the playback slot")
+        app.playback_slots.release()
+
+
+# ----------------------------------------------------------------------
+# Session lifecycle (AUDIT F-09)
+# ----------------------------------------------------------------------
+
+class TestSessionHousekeeping(DashboardTestCase):
+    PASSWORD = "Ledger-Thistle-49-Quay"
+
+    def auth(self) -> Authenticator:
+        return Authenticator(Store(self.store_root))
+
+    def test_expired_rows_are_purged(self) -> None:
+        a = self.auth()
+        secret = a.create_user("vera", self.PASSWORD, "admin")
+        a.login("vera", self.PASSWORD, totp_at(secret), "10.0.0.1", user_agent="UA")
+        with Store(self.store_root).connect() as conn:
+            conn.execute("UPDATE admin_session SET idle_expiry=0, hard_expiry=0")
+        self.assertEqual(a.purge_expired_sessions(), 1)
+        self.assertEqual(a.purge_expired_sessions(), 0)
+
+    def test_login_purges_expired_rows(self) -> None:
+        a = self.auth()
+        secret = a.create_user("walt", self.PASSWORD, "admin")
+        a.login("walt", self.PASSWORD, totp_at(secret), "10.0.0.1", user_agent="UA")
+        with Store(self.store_root).connect() as conn:
+            conn.execute("UPDATE admin_session SET idle_expiry=0, hard_expiry=0")
+        a.login("walt", self.PASSWORD, totp_at(secret), "10.0.0.1", user_agent="UA")
+        with Store(self.store_root).connect() as conn:
+            stale = conn.execute(
+                "SELECT COUNT(*) FROM admin_session WHERE idle_expiry < ?",
+                (time.time(),)).fetchone()[0]
+        self.assertEqual(stale, 0, "expired session rows accumulated after a login")
+
+    def test_session_is_bound_to_the_user_agent(self) -> None:
+        a = self.auth()
+        secret = a.create_user("xena", self.PASSWORD, "admin")
+        _, token = a.login("xena", self.PASSWORD, totp_at(secret), "10.0.0.1",
+                           user_agent="Mozilla/5.0 (test)")
+        self.assertIsNotNone(a.validate_session(token, user_agent="Mozilla/5.0 (test)"))
+        self.assertIsNone(a.validate_session(token, touch=False, user_agent="curl/8.0"),
+                          "a session cookie was accepted from a different client")
+        # The destruction is recorded, because a replayed token is a signal.
+        actions = [e["action"] for e in a.audit_entries(limit=50)]
+        self.assertIn("session.ua_mismatch", actions)
+
+    def test_missing_user_agent_does_not_lock_a_session_out(self) -> None:
+        a = self.auth()
+        secret = a.create_user("yuri", self.PASSWORD, "admin")
+        _, token = a.login("yuri", self.PASSWORD, totp_at(secret), "10.0.0.1")
+        self.assertIsNotNone(a.validate_session(token, user_agent=""))
+
+
+class TestManageUnlockCli(DashboardTestCase):
+    """
+    The recovery path has to work from a shell, not just from the library.
+
+    AUDIT F-05: five failed logins lock an account for 15 minutes, and the only
+    command that cleared the lock was `passwd`, because it happened to reset the
+    counter. That is not what an operator guesses at 3 a.m. This runs the actual
+    CLI, the way they would.
+    """
+
+    PASSWORD = "Ledger-Thistle-49-Quay"
+
+    def run_cli(self, *args: str):
+        return subprocess.run(
+            [sys.executable, str(ROOT / "dashboard" / "manage.py"),
+             "--store", str(self.store_root), *args],
+            capture_output=True, text=True, cwd=str(ROOT), timeout=120)
+
+    def test_unlock_clears_a_lock_without_changing_the_password(self) -> None:
+        a = Authenticator(Store(self.store_root))
+        secret = a.create_user("ops1", self.PASSWORD, "admin", actor="test")
+        for _ in range(5):
+            with self.assertRaises(AuthError):
+                a.login("ops1", "wrong-password", "000000", "10.0.0.1")
+        self.assertIsNotNone(a.get_user("ops1")["locked_until"])
+
+        proc = self.run_cli("unlock", "--username", "ops1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("not changed", proc.stdout)
+
+        self.assertIsNone(a.get_user("ops1")["locked_until"])
+        _, token = a.login("ops1", self.PASSWORD, totp_at(secret), "10.0.0.1")
+        self.assertTrue(token, "unlock did not restore sign-in")
+        self.assertIn("user.unlock", [e["action"] for e in a.audit_entries(limit=50)],
+                      "the unlock was not recorded in the audit trail")
+
+    def test_unlock_reports_an_unknown_account(self) -> None:
+        Store(self.store_root)
+        proc = self.run_cli("unlock", "--username", "nobody")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("no such user", proc.stderr)
+
+
+# ----------------------------------------------------------------------
+# Login CSRF (AUDIT F-07)
+# ----------------------------------------------------------------------
+
+class _NoLogHandlerMixin:
+    def log_message(self, fmt: str, *args: object) -> None:  # noqa: A003
+        pass
+
+
+class TestLoginCsrf(DashboardTestCase):
+    """
+    The login POST must be bound to the page the browser was served.
+
+    Before this, /login was routed before the CSRF gate and never validated a
+    token, while the form still rendered one -- and that token was
+    HMAC(process_secret, ""), identical for every visitor, so it protected
+    nothing even if it had been checked. Login CSRF lets an attacker sign a
+    victim into an account the attacker controls, after which the victim's
+    actions are attributed to it in the audit trail.
+    """
+
+    PASSWORD = "Ledger-Thistle-49-Quay"
+
+    def setUp(self) -> None:
+        super().setUp()
+        import server as server_mod
+        self.server_mod = server_mod
+        self.ingest()
+        self.app = server_mod.Dashboard(self.store_root, demo_mode=True)
+        self.app.auth.create_user("admin1", self.PASSWORD, "admin", actor="test")
+        handler = type("TestHandler", (_NoLogHandlerMixin, server_mod.Handler), {})
+        handler.app = self.app
+        handler.secure_cookies = False  # the test speaks plain HTTP on loopback
+        self.server = server_mod.TCPHTTPServer(("127.0.0.1", 0), handler)
+        self.port = self.server.server_address[1]
+        thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(self.server.shutdown)
+        self.addCleanup(self.server.server_close)
+        self.jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.jar))
+        self.base = f"http://127.0.0.1:{self.port}"
+
+    def request(self, path: str, data: dict | None = None, method: str = "GET"):
+        body = urllib.parse.urlencode(data).encode() if data is not None else None
+        req = urllib.request.Request(self.base + path, data=body, method=method)
+        try:
+            return self.opener.open(req, timeout=10)
+        except urllib.error.HTTPError as exc:
+            return exc  # a response object, so status and body are readable
+
+    def login_page_token(self) -> str:
+        page = self.request("/login").read().decode("utf-8")
+        match = re.search(r'name="csrf" value="([^"]+)"', page)
+        self.assertIsNotNone(match, "the login form no longer carries a CSRF field")
+        return match.group(1)
+
+    def cookie_value(self, name: str) -> str:
+        for cookie in self.jar:
+            if cookie.name == name:
+                return cookie.value
+        return ""
+
+    def test_the_form_token_is_bound_to_a_cookie(self) -> None:
+        token = self.login_page_token()
+        self.assertTrue(token)
+        self.assertEqual(self.cookie_value(self.server_mod.LOGIN_CSRF_COOKIE), token)
+        self.assertNotEqual(token, self.app.csrf_for(""),
+                            "the login page still renders the constant token")
+
+    def test_post_without_the_token_is_refused(self) -> None:
+        self.login_page_token()
+        resp = self.request("/login", {"username": "admin1", "password": self.PASSWORD},
+                            method="POST")
+        self.assertEqual(resp.status, 403)
+        self.assertEqual(self.cookie_value(self.server_mod.COOKIE_NAME), "",
+                         "a refused login still issued a session cookie")
+
+    def test_post_with_a_mismatched_token_is_refused(self) -> None:
+        self.login_page_token()
+        resp = self.request("/login",
+                            {"username": "admin1", "password": self.PASSWORD,
+                             "csrf": "not-the-token"}, method="POST")
+        self.assertEqual(resp.status, 403)
+
+    def test_the_previously_constant_token_is_not_accepted(self) -> None:
+        self.login_page_token()
+        resp = self.request("/login",
+                            {"username": "admin1", "password": self.PASSWORD,
+                             "csrf": self.app.csrf_for("")}, method="POST")
+        self.assertEqual(resp.status, 403,
+                         "the old constant token was accepted as a CSRF check")
+
+    def test_a_correct_token_signs_in(self) -> None:
+        token = self.login_page_token()
+        resp = self.request("/login",
+                            {"username": "admin1", "password": self.PASSWORD,
+                             "csrf": token}, method="POST")
+        # urllib follows the 303, so the outcome is checked by where the browser
+        # lands and by the session cookie the response installed.
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.geturl(), self.base + "/")
+        self.assertTrue(self.cookie_value(self.server_mod.COOKIE_NAME),
+                        "a valid login did not issue a session cookie")
+
+    def test_an_unusable_filter_is_a_visible_400(self) -> None:
+        token = self.login_page_token()
+        self.request("/login", {"username": "admin1", "password": self.PASSWORD,
+                                "csrf": token}, method="POST")
+        resp = self.request("/events?since=garbage")
+        self.assertEqual(resp.status, 400)
+        body = resp.read().decode("utf-8")
+        self.assertIn("cannot be used", body)
+        self.assertIn("not a date", body)
+        self.assertIn("garbage", body)
+
+    def test_an_oversized_body_closes_the_connection(self) -> None:
+        """A rejected body must not be parsed as the next request (AUDIT F-10)."""
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        try:
+            sock.sendall(b"POST /login HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                         b"Content-Length: 2000000\r\n\r\n")
+            response = b""
+            while True:
+                block = sock.recv(65536)
+                if not block:
+                    break
+                response += block
+            self.assertIn(b"403", response)
+            # Reaching EOF is the assertion: the server closed the connection,
+            # so the 2 MB of unread body can never be parsed as a second
+            # request. (Draining it would also do; closing is the version with
+            # no bound to get wrong on a slow sender.)
+            self.assertEqual(sock.recv(1), b"")
+        finally:
+            sock.close()
+
+
+class TestRelaxedControls(unittest.TestCase):
+    """AUDIT F-08: the running configuration must be stated, not implied."""
+
+    def ns(self, **kw):
+        base = dict(demo_mode=False, allow_framing=False, relax_cookie_policy=False,
+                    no_secure_cookies=False)
+        base.update(kw)
+        return type("NS", (), base)
+
+    def setUp(self) -> None:
+        import server as server_mod
+        self.server_mod = server_mod
+
+    def test_nothing_reported_when_nothing_is_relaxed(self) -> None:
+        self.assertEqual(self.server_mod.relaxed_controls(self.ns(), "tcp", ("127.0.0.1", 8443)), [])
+
+    def test_every_relaxation_is_listed(self) -> None:
+        items = self.server_mod.relaxed_controls(
+            self.ns(demo_mode=True, allow_framing=True, relax_cookie_policy=True,
+                    no_secure_cookies=True),
+            "tcp", ("0.0.0.0", 8443))
+        joined = " ".join(items)
+        for needle in ("demo-mode", "non-loopback", "allow-framing",
+                       "relax-cookie-policy", "no-secure-cookies"):
+            self.assertIn(needle, joined)
+
+    def test_demo_mode_on_a_reachable_interface_is_named(self) -> None:
+        """The old comment claimed this combination was refused. It is not."""
+        items = self.server_mod.relaxed_controls(self.ns(demo_mode=True),
+                                                 "tcp", ("10.0.0.5", 8443))
+        self.assertTrue(any("NOT enforced" in i for i in items))
+        self.assertTrue(any("non-loopback" in i for i in items))
+
+
+class TestHtmlEscaping(DashboardTestCase):
+    def test_backticks_are_escaped(self) -> None:
+        """AUDIT F-11: latent, not exploitable as written, cheap to close."""
+        out = safe_html("`onmouseover=alert(1)")
+        self.assertNotIn("`", out)
+        self.assertIn("&#96;", out)
+
+    def test_escaping_is_still_correct_for_the_usual_characters(self) -> None:
+        out = safe_html('<img src=x onerror="alert(1)">')
+        for raw in ("<", ">", '"'):
+            self.assertNotIn(raw, out)
+
 
 
 if __name__ == "__main__":

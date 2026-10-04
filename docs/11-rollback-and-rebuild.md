@@ -160,6 +160,15 @@ recordings, **and every captured file** — and removes the service account.
 will delete and refuses to proceed without the explicit flag. Captured files are
 evidence, and they may be the only record of an attempted intrusion.
 
+**And the path itself is checked before anything is removed.** `STATE_DIR` is a
+variable, and it is overridable in `/etc/cowrie-logship.env` — so the script
+refuses to delete a path unless it is the default `/opt/cowrie` or looks like a
+honeypot state directory (`var/lib/cowrie`, `etc/cowrie.cfg` or
+`venv/bin/cowrie`), and it never deletes `/`, a system directory, a symlink, a
+mount point or the current working directory. `--force-path` overrides only the
+first of those checks. If you see a refusal and do not recognise the path it
+names, do not force it: that message is the guard doing its job.
+
 Before running it, be able to answer yes to both:
 
 1. Has everything been exported and verified? (`rebuild.sh --export-only --verify`)

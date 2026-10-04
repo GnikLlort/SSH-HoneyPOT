@@ -124,6 +124,7 @@ an emergency teaches you to ignore alerts.
 | Disk filling | Upload flood, or shipping failing so pruning never qualifies | Check `/var/log/cowrie-alerts.log`; confirm shipping succeeds — pruning only runs after a verified ship |
 | `ps` or `free` output looks wrong | Overlay not loaded, or a patch fell back to stock | `journalctl -u cowrie \| grep -i overlay`. Check the two environment lines in the unit. `free` should still be safe: the bind-mount masks the real memory either way |
 | Conformance suite fails after a profile edit | Manifest and generated artefacts out of step | Rebuild the profile, reinstall, restart (`docs/04` §1) |
+| Dashboard reports "Account is locked" | Five failed sign-ins (15-minute per-account lock) | `python3 dashboard/manage.py --store <store> unlock --username <name>` — this clears the counter and **does not** change the password (`docs/15`) |
 
 ---
 
@@ -170,6 +171,13 @@ sudo ./deploy/uninstall.sh --stop                  # stop, keep everything
 sudo ./deploy/uninstall.sh --remove \
      --i-understand-this-destroys-evidence         # delete everything
 ```
+
+`--remove` checks `STATE_DIR` before it deletes anything: the path must look like
+a honeypot state directory (or be the default `/opt/cowrie`), and it must not be
+`/`, a system directory, a symlink, a mount point or the current working
+directory. A refusal names what the path actually is; `--force-path` overrides
+only the "does not look like ours" check, never the structural one. Deleting a
+path the guard refuses is not the intended workflow — read the message first.
 
 Then **remove the inbound tcp/22 rule**. A host with no honeypot and an open
 SSH port is just an unmanaged server.

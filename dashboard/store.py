@@ -969,20 +969,66 @@ class EventFilter:
         return max(1, min(int(self.limit or DEFAULT_PAGE_SIZE), MAX_PAGE_SIZE))
 
 
+class FilterError(ValueError):
+    """
+    A filter that cannot be honoured as written.
+
+    This exists so a bad filter fails loudly. It replaces a `return None` that
+    silently dropped the clause: `since=garbage` ran the query with no time
+    bound at all and returned more rows than were asked for, with a page that
+    looked exactly like a successful search. For a tool whose purpose is
+    establishing what happened in a window, returning a wider set than
+    requested is the wrong direction to fail -- an investigator who cannot
+    trust a filter cannot use the tool.
+    """
+
+
 def _date_bound(value: str, end: bool = False) -> float | None:
-    """Turn a yyyy-mm-dd or full ISO string into an epoch bound."""
+    """
+    Turn a yyyy-mm-dd or full ISO string into an epoch bound.
+
+    Empty input means "no bound" and returns None. Anything else that cannot
+    be parsed raises FilterError, which the HTTP layer turns into a visible
+    error rather than a wider search.
+    """
     if not value:
         return None
     text = value.strip()
+    if not text:
+        return None
+    which = "end" if end else "start"
     try:
         if len(text) == 10:
             dt = datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=timezone.utc)
             if end:
                 dt = dt + timedelta(days=1)
             return dt.timestamp()
-        return parse_ts_epoch(text)
-    except ValueError:
-        return None
+        epoch = parse_ts_epoch(text)
+    except (ValueError, OverflowError) as exc:
+        raise FilterError(
+            f"the {which} of the time range is not a date: {value!r} "
+            f"(expected YYYY-MM-DD or an ISO 8601 timestamp)") from exc
+    if epoch is None:
+        raise FilterError(
+            f"the {which} of the time range is not a date: {value!r} "
+            f"(expected YYYY-MM-DD or an ISO 8601 timestamp)")
+    return epoch
+
+
+def _like(term: str) -> str:
+    """
+    Build a LIKE pattern that matches `term` literally.
+
+    `%` and `_` are wildcards in SQL LIKE and the search box passed them
+    through unescaped: searching for the literal character `_` returned 1183 of
+    4874 events, every row with a non-empty command, filename, url or username.
+    A search that silently over-matches is how an investigator records that an
+    indicator appears somewhere it does not. The escape character also has to
+    be escaped, or a search for a backslash would escape the following
+    character and change the meaning of the pattern.
+    """
+    escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
 
 
 class Queries:
@@ -1105,8 +1151,12 @@ class Queries:
             clauses.append("ts_epoch < ?")
             args.append(until)
         if f.text:
-            clauses.append("(command LIKE ? OR filename LIKE ? OR url LIKE ? OR username LIKE ?)")
-            needle = f"%{f.text}%"
+            # ESCAPE '\' pairs with _like(): a typed % or _ is a character, not
+            # a wildcard. Both halves are needed; either alone is wrong.
+            clauses.append(
+                r"(command LIKE ? ESCAPE '\' OR filename LIKE ? ESCAPE '\' "
+                r"OR url LIKE ? ESCAPE '\' OR username LIKE ? ESCAPE '\')")
+            needle = _like(f.text)
             args.extend([needle] * 4)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         return where, args
@@ -1163,10 +1213,11 @@ class Queries:
             args.append(until)
         if f.text:
             clauses.append(
-                "(session_id LIKE ? OR username LIKE ? OR client_version LIKE ? "
-                "OR EXISTS (SELECT 1 FROM command c WHERE c.sensor=session.sensor "
-                "AND c.session_id=session.session_id AND c.command LIKE ?))")
-            needle = f"%{f.text}%"
+                r"(session_id LIKE ? ESCAPE '\' OR username LIKE ? ESCAPE '\' "
+                r"OR client_version LIKE ? ESCAPE '\' "
+                r"OR EXISTS (SELECT 1 FROM command c WHERE c.sensor=session.sensor "
+                r"AND c.session_id=session.session_id AND c.command LIKE ? ESCAPE '\'))")
+            needle = _like(f.text)
             args.extend([needle] * 4)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         limit = f.clamped_limit()
@@ -1249,8 +1300,9 @@ class Queries:
             clauses.append("t.sensor = ?")
             args.append(f.sensor)
         if f.text:
-            clauses.append("(t.filename LIKE ? OR t.url LIKE ? OR t.sha256 LIKE ?)")
-            needle = f"%{f.text}%"
+            clauses.append(r"(t.filename LIKE ? ESCAPE '\' OR t.url LIKE ? "
+                           r"ESCAPE '\' OR t.sha256 LIKE ? ESCAPE '\')")
+            needle = _like(f.text)
             args.extend([needle] * 3)
         since = _date_bound(f.since)
         if since is not None:

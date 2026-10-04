@@ -25,7 +25,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lib.config_check import isolation_config_problems  # noqa: E402
 from lib.cowrie_client import OpenSSHClient, paramiko_exec  # noqa: E402
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 @dataclass
@@ -417,6 +420,31 @@ def check_interop(s: Suite, c: OpenSSHClient, exp: dict) -> None:
         s.add("paramiko exec interop", True, "paramiko completed the exec request", "interop", "info")
 
 
+def check_config(s: Suite, cfg_path: Path) -> None:
+    """
+    Static checks that do not need the lab.
+
+    The audit recommended these be asserted somewhere, and here is the right
+    somewhere: everything the isolation argument claims about port forwarding
+    rests on two values that no test previously read. With `forward_redirect`
+    or `forward_tunnel` true, Cowrie opens a real connection to a
+    visitor-named host -- the honeypot becomes a route out of the boundary.
+    These run before the client connects, so they are reported even on a
+    machine where the lab is not up (the suite still exits 2 if it cannot
+    authenticate, but the report names the config problem first).
+    """
+    problems = isolation_config_problems(cfg_path)
+    if problems:
+        for problem in problems:
+            s.add(f"isolation config: {problem}", False, problem, "isolation", "high")
+    else:
+        s.add("forwarding answered without a real connection",
+              True,
+              "forward_redirect and forward_tunnel are both false, so Cowrie's "
+              "fake forwarding channel answers and no outbound socket is opened",
+              "isolation", "high")
+
+
 # ---------------------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -426,6 +454,8 @@ def main() -> int:
     ap.add_argument("--user", default=None)
     ap.add_argument("--password", default=None)
     ap.add_argument("--json", default=None, help="write machine-readable results here")
+    ap.add_argument("--config", default=str(REPO_ROOT / "config" / "cowrie.cfg"),
+                    help="operator config to check for isolation regressions")
     args = ap.parse_args()
 
     exp = json.loads(Path(args.expect).read_text(encoding="utf-8"))
@@ -434,9 +464,16 @@ def main() -> int:
     password = args.password or "Sunrise-Ledger-1972"
 
     s = Suite()
+    check_config(s, Path(args.config))
+
     client = OpenSSHClient(host=args.host, port=args.port, username=user, password=password)
     client.start()
     if not client.authenticated:
+        # Report the static config findings before giving up: they are the ones
+        # that can be acted on without a lab.
+        for chk in s.checks:
+            if not chk.ok:
+                print(f"[config] {chk.name}\n          -> {chk.detail}", file=sys.stderr)
         print(f"FATAL: could not authenticate as {user}", file=sys.stderr)
         return 2
 

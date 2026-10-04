@@ -68,7 +68,7 @@ instance.
 
 ### `tests/test_conformance.py` — the realism contract
 
-197 checks across 15 categories, all derived from `expectations.json`, which is
+198 checks across 16 categories, all derived from `expectations.json`, which is
 generated from `realism/identity.yaml`. That derivation is the point: the test
 does not hardcode "the hostname is `deploy-01`", it asserts that the hostname
 reported by `hostname`, by `uname -n`, by `/etc/hostname` and by the SSH banner

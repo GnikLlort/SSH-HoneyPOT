@@ -40,6 +40,15 @@ import tarfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+_HERE = Path(__file__).resolve().parent
+for _cand in (_HERE.parent / "shared", Path("/opt/honeypot-monitor/share")):
+    if (_cand / "safe_paths.py").is_file():
+        if str(_cand) not in sys.path:
+            sys.path.insert(0, str(_cand))
+        break
+from safe_paths import (MARKER_BUNDLE, UnsafePathError,  # noqa: E402
+                        guard_delete_target, write_marker)
+
 
 def sha256_file(path: Path, chunk: int = 1 << 20) -> str:
     h = hashlib.sha256()
@@ -72,14 +81,24 @@ def read_sensor(state: Path) -> str:
 
 
 def build_bundle(state: Path, out: Path, with_downloads: bool = True,
-                 max_download_mb: int = 64) -> dict:
+                 max_download_mb: int = 64, allow_force: bool = False) -> dict:
     """
     Assemble the bundle. Returns the manifest.
 
     Captured files larger than max_download_mb are skipped with a note in the
     manifest rather than copied: they are recorded by hash in the event log
     anyway, and one oversized upload must not stall the shipping pipeline.
+
+    `out` is replaced wholesale, so it goes through the same delete guard as the
+    profile builder. An empty directory, one with a manifest from an earlier
+    run, or one this program marked, is ours to replace; anything else is
+    refused unless the caller explicitly overrides it.
     """
+    try:
+        out = guard_delete_target(out, kind="bundle-output", allow_force=allow_force)
+    except UnsafePathError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2)
     if out.exists():
         shutil.rmtree(out)
     (out / "tty").mkdir(parents=True)
@@ -183,6 +202,11 @@ def build_bundle(state: Path, out: Path, with_downloads: bool = True,
     (out / "SENSOR").write_text(sensor + "\n", encoding="utf-8")
     manifest["sensor"] = sensor
     (out / "BUNDLE.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    # Marks the directory as ours for the next run's guard. Written last, so an
+    # interrupted bundle is not mistaken for a complete one.
+    write_marker(out, MARKER_BUNDLE,
+                 f"bundle staging directory written by dashboard/bundle.py at "
+                 f"{manifest['built_at']} from {state}")
     return manifest
 
 
@@ -195,6 +219,10 @@ def main() -> int:
     ap.add_argument("--no-downloads", action="store_true",
                     help="skip captured files (metadata still arrives via the event log)")
     ap.add_argument("--max-download-mb", type=int, default=64)
+    ap.add_argument("--force-recursive-delete", action="store_true",
+                    help="replace --out even when it does not look like a bundle "
+                         "staging directory. Read the guard's refusal message "
+                         "first: it names what the path actually is.")
     args = ap.parse_args()
 
     state = Path(args.state)
@@ -205,7 +233,8 @@ def main() -> int:
 
     manifest = build_bundle(state, Path(args.out),
                             with_downloads=not args.no_downloads,
-                            max_download_mb=args.max_download_mb)
+                            max_download_mb=args.max_download_mb,
+                            allow_force=args.force_recursive_delete)
 
     if args.tar:
         with tarfile.open(args.tar, "w:gz") as tf:
