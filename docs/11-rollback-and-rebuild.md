@@ -246,11 +246,18 @@ that denies deletion to the honeypot.
 # In the repository:
 $EDITOR deploy/versions.env          # change COWRIE_COMMIT to the previous pin
 git commit -am "pin cowrie back to <previous>"
-# On the honeypot:
-sudo git -C /opt/cowrie/share/pkg pull
-sudo /opt/cowrie/share/pkg/deploy/install.sh --apply
+# On the honeypot, from the source checkout (docs/03 creates it at
+# /root/honeypot-src; /opt/cowrie/share/pkg has no .git and is not a checkout
+# you can pull):
+cd /root/honeypot-src
+sudo git fetch origin && sudo git checkout <the commit with the older pin>
+sudo ./deploy/install.sh --apply
 sudo systemctl restart cowrie
 ```
+
+`deploy/update.sh --apply` does the same thing with a dry run, a dirty-tree
+check and a recorded rollback path; `docs/17` is the whole procedure, including
+what an update overwrites and what it never touches.
 
 `install.sh` is idempotent: it checks out the new commit, reinstalls into the
 existing virtualenv and reinstalls the generated profile. The overlay is

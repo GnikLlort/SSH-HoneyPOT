@@ -14,7 +14,11 @@
 #   sudo ./install.sh --apply --stage 5   # perform one stage only
 #
 # It is written to be safe to re-run: each stage checks whether its work is
-# already done and skips it.
+# already done and skips it, and the pinned Cowrie checkout is refreshed rather
+# than re-cloned. That is what makes this script the update path as well as the
+# install path: pull a newer commit, re-run it, restart the service. See
+# docs/17-updating-the-deployment.md, or use ./deploy/update.sh, which wraps
+# this script with the pre-flight checks and the rollback command.
 #
 # PREREQUISITES
 #   * A freshly created Ubuntu 24.04 LTS EC2 instance, in its own AWS account
@@ -36,6 +40,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=/dev/null
 source "$REPO_ROOT/deploy/versions.env"
+# shellcheck source=/dev/null
+source "$REPO_ROOT/deploy/lib/checkout.sh"
 
 MODE="dry-run"
 ONLY_STAGE=""
@@ -186,11 +192,15 @@ stage "Fetch Cowrie at the pinned commit and build an isolated virtualenv"
 # Pinning to a commit (not a tag) means the exact code under test is the exact
 # code deployed. The virtualenv keeps Cowrie's dependencies away from the
 # system Python, which the rest of the OS relies on.
+#
+# "Re-run safe" is load-bearing: the documented update path is to run this
+# script again against a newer pin (docs/17). `git clone` refuses to run into a
+# directory that already exists, so the checkout is delegated to
+# deploy/lib/checkout.sh, which clones, fetches, re-checks-out and verifies the
+# commit -- and is tested directly (tests/test_deployment_scripts.py).
 BUILD_DIR="$STATE_DIR/build"
-act "clone the pinned commit into a build directory" \
-    git clone --quiet "$COWRIE_REPO" "$BUILD_DIR/cowrie"
-act "check out the exact pinned commit" \
-    git -C "$BUILD_DIR/cowrie" checkout --quiet "$COWRIE_COMMIT"
+act "clone or refresh the pinned Cowrie checkout" \
+    ensure_pinned_checkout "$BUILD_DIR/cowrie" "$COWRIE_REPO" "$COWRIE_COMMIT"
 act "create the virtualenv" \
     python3 -m venv "$STATE_DIR/venv"
 act "install Cowrie from the pinned source (dependencies are pinned in its pyproject.toml)" \
@@ -334,6 +344,15 @@ act "install the log-shipping unit and timer" \
         "$REPO_ROOT/deploy/systemd/cowrie-logship.service" \
         "$REPO_ROOT/deploy/systemd/cowrie-logship.timer" \
         /etc/systemd/system/
+# The bundle shipper is what feeds the off-host monitoring dashboard. It is
+# installed but NOT enabled: it is a second egress path that carries the event
+# log and the session recordings to another host, so enabling it is a
+# deliberate decision (docs/16 §3), not something an installer decides.
+act "install the dashboard bundle shipper (not enabled)" \
+    install -o root -g root -m 0644 \
+        "$REPO_ROOT/deploy/systemd/cowrie-bundle-ship.service" \
+        "$REPO_ROOT/deploy/systemd/cowrie-bundle-ship.timer" \
+        /etc/systemd/system/
 act "reload systemd so it sees the new units" \
     systemctl daemon-reload
 act "enable and start the honeypot" \
@@ -351,6 +370,8 @@ act "make the playback server readable by the service account" \
     install -o "$HONEYPOT_USER" -g "$HONEYPOT_GROUP" -m 0750 \
         "$REPO_ROOT/playback/server.py" "$STATE_DIR/playback/server.py"
 note "start it for a review with: sudo systemctl start cowrie-playback"
+note "to feed the off-host dashboard: sudo systemctl enable --now cowrie-bundle-ship.timer"
+note "(the package it needs is already at $STATE_DIR/share/pkg/dashboard/)"
 
 # ---------------------------------------------------------------------------
 stage "Install the operational helper scripts"
@@ -362,6 +383,7 @@ act "install health check, quarantine, canary and retention helpers" \
         "$REPO_ROOT/ops/canary_scan.sh" \
         "$REPO_ROOT/ops/alert_dispatch.sh" \
         "$REPO_ROOT/ops/prune_local.sh" \
+        "$REPO_ROOT/ops/export_bundle.sh" \
         /usr/local/sbin/
 act "install the logrotate policy" \
     install -o root -g root -m 0644 \

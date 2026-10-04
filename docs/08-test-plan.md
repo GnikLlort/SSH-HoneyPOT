@@ -119,6 +119,36 @@ recordings, refusal to bind publicly, and the response headers.
 See `docs/07-session-playback.md` §4 for the mapping between each attack and its
 test.
 
+### `tests/test_dashboard.py` — the monitoring store and interface
+
+95 tests, no running sensor required: the bundle fixture is synthesised in
+Cowrie's real recording format, so the tests exercise the same ingest path the
+timer uses. Covers sanitation parity with the on-host viewer, credential
+masking including Cowrie's prose `message` field, the recording join key, the
+ingest deduplication key, filter validation, playback memory and concurrency
+bounds, sessions bound to a client, the login CSRF binding, the rejected-sign-in
+responses, and the account-management CLI from a shell.
+
+### `tests/test_safety_guards.py` — the destructive paths
+
+31 tests on the code that deletes things and the invariants that keep the
+honeypot isolated: the Python and shell delete guards refusing system
+directories, symlinks, mount points and the working directory even under force;
+the uninstaller deleting the path it actually checked; every `rm -rf` in a
+shipped script accounted for; and the isolation constraints in the operator
+config.
+
+### `tests/test_deployment_scripts.py` — the scripts an operator runs
+
+22 tests against the deployment scripts themselves: the pinned-checkout helper
+being run **twice** (the update path — this is the regression that F-16 was),
+the update wrapper's dry run and refusals, the dashboard installer's dry run,
+its refusal to bind a non-loopback address and its refusal to install beside
+the honeypot, the shipped systemd units (the dashboard unit is `AF_UNIX`-only
+and does not run as root; no unit carries an exposure acknowledgement flag),
+and the documentation: every `docs/*.md` is in the index and every relative
+link resolves.
+
 ### `tests/probe_discovery.py` — the exploratory sweep
 
 An 84-command sweep an operator might run, used to find inconsistencies that

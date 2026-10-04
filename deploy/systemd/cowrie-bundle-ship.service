@@ -1,0 +1,24 @@
+[Unit]
+Description=Build and ship a honeypot export bundle for the monitoring host
+Documentation=file:/opt/cowrie/DEPLOYMENT.txt
+Documentation=file:/opt/cowrie/share/pkg/docs/16-dashboard-setup.md
+After=network-online.target
+# No dependency on cowrie.service: packing a bundle only needs files that are
+# already on disk, and a stopped honeypot still has evidence worth shipping.
+
+[Service]
+Type=oneshot
+User=root
+Environment=TZ=UTC
+EnvironmentFile=-/etc/cowrie-logship.env
+ExecStart=/usr/local/sbin/export_bundle.sh
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=600
+# Writes only its own staging directory; the state directory is read-only here
+# so a bug in this unit cannot alter evidence while it packs it.
+ReadWritePaths=/opt/cowrie/var/spool
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes

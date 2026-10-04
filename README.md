@@ -32,7 +32,9 @@ with SSH exposed, and records everything a visitor does to it:
 * **An off-host monitoring dashboard** — a second program for a separate
   monitoring host: searchable events and sessions, role-based access with MFA,
   exports, health, and a full audit trail. It cannot reach the honeypot, cannot
-  run anything, and never opens a captured file (`docs/15`).
+  run anything, and never opens a captured file. `deploy/install-dashboard.sh`
+  sets it up; `docs/16` is the walkthrough from an empty host to a first
+  sign-in, and `docs/15` is what it guarantees.
 
 ---
 
@@ -78,14 +80,19 @@ config/
 deploy/
   versions.env            the single place a version is written down
   install.sh              10 staged, idempotent, dry-run by default
+  update.sh               update to a branch/tag/commit; records the rollback
+  install-dashboard.sh    the off-host reviewer, on its own host
   uninstall.sh            --stop (keep evidence) vs --remove (destroy it)
   rebuild.sh              evidence-export-first recovery path
-  systemd/                the service, health check, log shipper, playback UI
+  lib/checkout.sh         clone-or-refresh a pinned checkout, idempotently
+  systemd/                the service, health check, log shipper, playback UI,
+                          bundle shipper, and the two dashboard units
   aws/security-groups.md  VPC, security groups, IAM, boundary verification
   cowrie-logship.env.example
 ops/
   healthcheck.sh          service, banner, log staleness, disk, outbound, isolation
   quarantine_sync.sh      ship evidence and hash manifest; prune only after verify
+  export_bundle.sh        pack a bundle for the dashboard and ship it
   alert_dispatch.sh       webhook + local alert log; no captured content
   prune_local.sh, canary_scan.sh, logrotate/, alerts/rules.md
 playback/
@@ -102,11 +109,12 @@ shared/
 tests/
   test_conformance.py     198 checks: the realism contract
   test_playback.py        32 checks: the reviewer's safety contract
-  test_dashboard.py       81 checks: sanitising, auth, filters, playback bounds
-  test_safety_guards.py   26 checks: delete guards and the isolation invariant
+  test_dashboard.py       95 checks: sanitising, auth, filters, playback bounds
+  test_safety_guards.py   31 checks: delete guards and the isolation invariant
+  test_deployment_scripts.py 22 checks: update/install scripts, units, doc links
   probe_discovery.py      exploratory 84-command sweep
   lib/                    OpenSSH-based client and lab control
-AUDIT.md                  adversarial code audit: 14 findings, fixes and tests
+AUDIT.md                  adversarial code audit: 16 findings, fixes and tests
 docs/                     see below
 ```
 
@@ -133,6 +141,8 @@ Start with [`docs/README.md`](docs/README.md).
 | [13 — LLM mode review](docs/13-llm-mode-review.md) | Why it is off, and the preconditions to enable it |
 | [14 — Operations runbook](docs/14-operations-runbook.md) | Day-to-day, alerts, maintenance, incident response |
 | [15 — Monitoring dashboard](docs/15-monitoring-dashboard.md) | The off-host reviewer: roles, limits, what it cannot do |
+| [16 — Getting the dashboard working](docs/16-dashboard-setup.md) | Step by step to a working sign-in: bundles, install, accounts |
+| [17 — Updating an installed deployment](docs/17-updating-the-deployment.md) | Install a branch, verify it, roll it back |
 
 Related material outside `docs/`:
 
@@ -153,10 +163,11 @@ Related material outside `docs/`:
 | Emulated host | Debian 12.5, kernel `6.1.0-21-amd64`, `OpenSSH_9.2p1 Debian-2+deb12u3` |
 | Conformance | **197 / 198**, 0 actionable failures (1 `info`-level interop note) |
 | Playback | **32 / 32** |
-| Dashboard | **81 / 81** |
+| Dashboard | **95 / 95** |
 | Safety guards | **31 / 31** |
+| Deployment scripts and docs | **22** (21 pass; 1 needs root) |
 | Profile build | 6 / 6 invariants |
-| Audit | 14 findings, all fixed; see [`AUDIT.md`](AUDIT.md) |
+| Audit | 16 findings, all fixed; see [`AUDIT.md`](AUDIT.md) |
 
 Fully pinned in [`deploy/versions.env`](deploy/versions.env) — Cowrie plus every
 transitive dependency, with the commit rather than the tag, because tags are
@@ -176,6 +187,7 @@ python3 tests/test_conformance.py --expect build/profile/expectations.json
 python3 tests/test_playback.py
 python3 tests/test_dashboard.py
 python3 tests/test_safety_guards.py
+python3 tests/test_deployment_scripts.py
 bash deploy/install.sh                                     # dry run — changes nothing
 ```
 

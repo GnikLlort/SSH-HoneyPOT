@@ -29,6 +29,8 @@ the honest summary.
 | [13 — LLM mode review](13-llm-mode-review.md) | Why LLM mode is off, and the conditions for turning it on |
 | [14 — Operations runbook](14-operations-runbook.md) | Day-to-day operation, alert response, maintenance, incident response |
 | [15 — Monitoring dashboard](15-monitoring-dashboard.md) | The off-host reviewer: roles, limits, what it cannot do |
+| [16 — Getting the dashboard working](16-dashboard-setup.md) | Two hosts, step by step: ship bundles, install, add a user, sign in |
+| [17 — Updating an installed deployment](17-updating-the-deployment.md) | Install a different branch, verify it, roll it back |
 
 Related material outside `docs/`:
 

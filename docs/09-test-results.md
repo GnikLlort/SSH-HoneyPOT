@@ -299,3 +299,38 @@ Two limits of this table, stated rather than implied:
 * **Nothing here has faced the internet**, and no load test or browser test was
   run. The dashboard's XSS-adjacent behaviour (F-01, F-11) is still verified by
   wire capture and static analysis rather than in a rendering engine.
+
+---
+
+## 9. Third pass: the dashboard from an empty host
+
+**Run:** 2026-10-04, after F-15 and F-16 were found by installing the dashboard
+on a host with nothing on it and following `docs/16` rather than driving the
+modules in-process.
+
+| Suite | Result |
+|---|---|
+| `tests/test_conformance.py` | **197 / 198**, 0 actionable (1 `info` interop note) |
+| `tests/test_dashboard.py` | **95 / 95** |
+| `tests/test_safety_guards.py` | **31 / 31** |
+| `tests/test_playback.py` | **32 / 32** |
+| `tests/test_deployment_scripts.py` | **22** (21 pass, 1 skipped — needs root) |
+| `deploy/install-dashboard.sh --apply` | exit 0, end to end: account, package, units, store, ingest |
+| Sign-in over the installed UNIX socket | `/login` 200, a rejected sign-in 401, valid credentials 303, session page and player 200 |
+| `manage.py init` / `adduser --password-stdin` | exit 0; weak password, empty stdin and no-TTY each exit 2 with the reason |
+
+| Finding | Fix | Guarded by |
+|---|---|---|
+| F-15 every rejected sign-in answered HTTP 500 | the `AuthError` handler passes the login page it already has, instead of re-encoding it | `TestRejectedLogin` (7), verified to fail 5/7 against the pre-fix line |
+| F-16 the installer aborted on its second run | `deploy/lib/checkout.sh::ensure_pinned_checkout`; the unrecognised-directory path renames rather than deletes | `TestPinnedCheckout` (6), including the same call twice |
+
+Two limits of this pass, stated rather than implied:
+
+* **The systemd units were written and syntax-verified, not started.** The
+  machine this was tested on has no systemd bus, so the dashboard was run
+  directly as its service account with the same arguments the unit uses. The
+  install path that systemd performs — `daemon-reload`, `enable --now` — is
+  exercised on a real host by the reader, not here.
+* **The bundle upload was exercised up to the archive and its hash**, not
+  against S3. The AWS half of `ops/export_bundle.sh` is the same `aws s3 cp`
+  pattern `ops/quarantine_sync.sh` already uses in the field.
