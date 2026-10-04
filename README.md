@@ -142,11 +142,18 @@ mutable.
 python3 -m venv .venv && .venv/bin/pip install -e .        # or install Cowrie 3.1.0
 .venv/bin/python realism/build_profile.py \
     --identity realism/identity.yaml --out build/profile
-bash tests/lib/labctl.sh lab_restart
+bash tests/lib/labctl.sh lab_init     # materialise lab/ from build/profile
+bash tests/lib/labctl.sh lab_restart  # (lab_start initialises it too, if missing)
 python3 tests/test_conformance.py --expect build/profile/expectations.json
 python3 tests/test_playback.py
 bash deploy/install.sh                                     # dry run — changes nothing
 ```
+
+The lab is loopback-only on `127.0.0.1:2222` and is built from the same
+generated profile the deployment installs — `lab_init` is idempotent, so
+re-running it after an edit to `realism/identity.yaml` refreshes the lab.
+`lab_start` prints the captured startup log instead of timing out silently if
+Cowrie refuses to start.
 
 `deploy/install.sh` prints its full plan and changes nothing without `--apply`.
 

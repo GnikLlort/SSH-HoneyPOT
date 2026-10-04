@@ -28,11 +28,23 @@ the command produced parsable output.
 ### The local lab
 
 Cowrie runs on `127.0.0.1:2222` with the generated profile as its filesystem and
-the realism overlay loaded. Started and stopped with `tests/lib/labctl.sh`.
+the realism overlay loaded. Built, started and stopped with `tests/lib/labctl.sh`.
 
 ```
+tests/lib/labctl.sh lab_init                    # build lab/ from build/profile
 tests/lib/labctl.sh lab_start | lab_stop | lab_restart
 ```
+
+`lab_init` materialises the lab from the generated profile: the same filesystem,
+process table, txtcmd overrides, credential policy and operator config that
+`deploy/install.sh` stage 7 installs, with two deliberate differences — it
+listens on the loopback interface and port 2222 rather than `0.0.0.0:22`, and it
+runs as the invoking user rather than the `cowrie` service account. It is
+idempotent, so re-running it after editing `realism/identity.yaml` refreshes the
+lab. `lab_start` runs it automatically when `lab/etc/cowrie.cfg` is missing, so
+the documented sequence works from a clean checkout; when Cowrie refuses to
+start it prints the last lines of `lab/var/log/cowrie/lab-start.log` rather than
+timing out silently.
 
 `lab_stop` resolves the PID from the pidfile, and falls back to scanning `/proc`
 for a `twistd` whose working directory is the lab. It **never** uses
@@ -113,6 +125,18 @@ An 84-command sweep an operator might run, used to find inconsistencies that
 were not yet encoded as checks. Output is kept under `lab/probe*/` for
 before/after comparison. This is where the defects that later became fixes were
 originally found.
+
+```bash
+python3 tests/probe_discovery.py --out lab/probe
+```
+
+The defaults are the shipped credential policy: `deploy` with the synthetic
+password from `config/userdb.txt`. The sweep also attempts the pairs that policy
+must reject (`root/root`, `admin/admin`, `test/test`, `svc-backup/svc-backup`)
+and records, per attempt, whether the observed outcome matched the expected one.
+A mismatch fails the run, because a divergence there means the honeypot is
+either accepting credentials it must not or refusing ones the operator
+configured. Override with `--user`/`--password` if you changed the allow-list.
 
 ---
 

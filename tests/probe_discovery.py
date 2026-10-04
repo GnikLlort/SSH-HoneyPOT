@@ -72,7 +72,7 @@ DISCOVERY_COMMANDS: list[str] = [
     "w",
     "last",
     "ls -la /home",
-    "ls -la /home/phil",
+    "ls -la /home/{user}",
     "ls -la /root",
     "cat /etc/shadow",
     # --- services / processes ---
@@ -98,7 +98,7 @@ DISCOVERY_COMMANDS: list[str] = [
     "cat /var/log/wtmp",
     "cat ~/.bash_history",
     "cat /root/.bash_history",
-    "cat /home/phil/.bash_history",
+    "cat /home/{user}/.bash_history",
     # --- packages ---
     "dpkg -l",
     "dpkg -l openssh-server",
@@ -123,13 +123,21 @@ DISCOVERY_COMMANDS: list[str] = [
 ]
 
 
+def discovery_commands(user: str) -> list[str]:
+    """The sweep, with the primary account's home directory substituted in."""
+    return [cmd.replace("{user}", user) for cmd in DISCOVERY_COMMANDS]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", default="lab/probe")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=2222)
-    parser.add_argument("--user", default="phil")
-    parser.add_argument("--password", default="fout")
+    # Defaults match the shipped credential policy (config/userdb.txt), which
+    # allows the primary account only. Cowrie's stock phil/fout pair is denied
+    # by that policy, so a sweep using it could never authenticate.
+    parser.add_argument("--user", default="deploy")
+    parser.add_argument("--password", default="Sunrise-Ledger-1972")
     args = parser.parse_args()
 
     out = Path(args.out)
@@ -139,31 +147,45 @@ def main() -> int:
     (out / "banner.txt").write_text(banner + "\n", encoding="utf-8")
     print(f"banner: {banner}")
 
-    # Authentication behaviour: one known-good pair, several known-bad.
+    # Authentication behaviour: one known-good pair - the account passed in -
+    # plus the pairs the credential policy must reject. Each attempt carries
+    # the outcome the policy predicts, so a divergence is a finding rather
+    # than a line of output nobody reads.
+    attempts: list[tuple[str, str, bool]] = [
+        (args.user, args.password, True),      # allowed by userdb.txt
+        ("root", "root", False),               # PermitRootLogin prohibit-password
+        ("admin", "admin", False),             # unknown user
+        ("test", "test", False),               # must never hit a wildcard rule
+        ("svc-backup", "svc-backup", False),   # shell is /usr/sbin/nologin
+        (args.user, "wrongpassword", False),   # wrong password for a real account
+    ]
     outcomes = try_logins(
-        [
-            ("phil", "fout"),
-            ("root", "root"),
-            ("root", "toor"),
-            ("admin", "admin"),
-            ("phil", "wrongpassword"),
-        ],
+        [(user, password) for user, password, _ in attempts],
         args.host,
         args.port,
     )
     (out / "auth_outcomes.json").write_text(
         json.dumps(
-            [{"username": u, "password": p, "accepted": a} for u, p, a in outcomes],
+            [
+                {"username": u, "password": p, "expected_accepted": expected,
+                 "accepted": accepted, "agrees": accepted == expected}
+                for (u, p, expected), (_u, _p, accepted) in zip(attempts, outcomes)
+            ],
             indent=2,
         )
         + "\n",
         encoding="utf-8",
     )
-    for u, p, a in outcomes:
-        print(f"auth {u}/{p}: {'ACCEPTED' if a else 'rejected'}")
+    mismatches = 0
+    for (u, p, expected), (_u, _p, accepted) in zip(attempts, outcomes):
+        verdict = "PASS" if accepted == expected else "MISMATCH"
+        if accepted != expected:
+            mismatches += 1
+        print(f"auth {u}/{p}: {'ACCEPTED' if accepted else 'rejected'} "
+              f"(expected {'accepted' if expected else 'rejected'}) {verdict}")
 
     log = exec_commands(
-        DISCOVERY_COMMANDS,
+        discovery_commands(args.user),
         username=args.user,
         password=args.password,
         host=args.host,
@@ -192,6 +214,13 @@ def main() -> int:
     print(f"\nwrote {out}/discovery.txt ({len(log.results)} commands)")
     if log.errors:
         print("errors:", json.dumps(log.errors, indent=2))
+    if mismatches:
+        # A credential-policy divergence means the honeypot is either accepting
+        # credentials it must not, or refusing ones the operator configured.
+        # Either way the sweep's output cannot be trusted without explaining it.
+        print(f"\nFAIL: {mismatches} authentication outcome(s) disagreed with the "
+              f"credential policy", file=sys.stderr)
+        return 1
     return 0
 
 
