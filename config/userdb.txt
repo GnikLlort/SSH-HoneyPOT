@@ -1,0 +1,81 @@
+# =============================================================================
+# Cowrie userdb - credential policy for the emulated host
+# =============================================================================
+#
+# Format:  username:x:password
+#   *   wildcard for username or password
+#   !   prefix denies; processing stops at the FIRST matching line
+#
+# Install to:  <state>/etc/userdb.txt
+#
+# -----------------------------------------------------------------------------
+# WHY THIS FILE EXISTS
+# -----------------------------------------------------------------------------
+# Cowrie's built-in default rule set ends with:
+#
+#     root:x:*        -> every password is accepted for root
+#     phil:x:*        -> every password is accepted for phil
+#     *:x:*           -> every password is accepted for every username
+#
+# With those rules in force every login succeeds. An operator who types
+# "test"/"test" and lands in a shell learns two things at once: that no real
+# authentication took place, and that the box is a honeypot. It also destroys
+# the value of the authentication_result field, because nothing ever fails.
+#
+# This file replaces that with an explicit allowlist. The consequences are
+# deliberate:
+#
+#   * Successful logins are earned, so a shell session means something.
+#   * Failed logins look like failed logins, and are recorded as such.
+#   * Brute-force traffic produces the same "Failed password for invalid
+#     user" sequence a real host would emit, which is what makes the
+#     credential telemetry worth collecting.
+#
+# -----------------------------------------------------------------------------
+# RULE 1 - root cannot log in with a password
+# -----------------------------------------------------------------------------
+# The generated /etc/ssh/sshd_config this profile serves contains:
+#
+#     PermitRootLogin prohibit-password
+#
+# If root could log in with a password here, `cat /etc/ssh/sshd_config`
+# would directly contradict observed behaviour. Denying root password login
+# makes the file truthful. Root sessions remain possible via the
+# keyboard-interactive path if an operator enables it, but not by password.
+#
+root:x:!*
+
+# -----------------------------------------------------------------------------
+# RULE 2 - the primary operator account
+# -----------------------------------------------------------------------------
+# The account the profile's filesystem, home directory, shell history and
+# decoy documents all describe. It accepts a short, documented list of weak
+# passwords so that ordinary brute-force traffic occasionally succeeds and
+# yields a shell session to record.
+#
+# REVIEW BEFORE DEPLOYMENT: delete any of these you do not want to accept.
+# Removing all but the first line makes the account reachable only with the
+# synthetic password, which is the strictest configuration.
+#
+deploy:x:deploy
+deploy:x:deploy123
+deploy:x:Password123
+deploy:x:admin123
+deploy:x:Sunrise-Ledger-1972
+
+# -----------------------------------------------------------------------------
+# RULE 3 - the service account
+# -----------------------------------------------------------------------------
+# /etc/passwd gives svc-backup the shell /usr/sbin/nologin, so a password
+# login for it must fail. This keeps the behaviour consistent with the file.
+#
+svc-backup:x:!*
+
+# -----------------------------------------------------------------------------
+# RULE 4 - everything else is denied
+# -----------------------------------------------------------------------------
+# Unknown usernames must produce "Failed password for invalid user <name>"
+# rather than a shell. This is the line that stops the honeypot from
+# accepting arbitrary credentials, and it must stay last.
+#
+*:x:!*

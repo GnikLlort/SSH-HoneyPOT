@@ -1,0 +1,70 @@
+[Unit]
+Description=Honeypot session playback UI (administrator only)
+Documentation=file:/opt/cowrie/docs/07-session-playback.md
+# Ordering only. No [Install] alias into multi-user.target: this unit is started
+# on demand for a review session and stopped afterwards, so the evidence UI is
+# not sitting on the host the rest of the time.
+After=network-online.target cowrie.service
+Wants=cowrie.service
+
+[Service]
+Type=simple
+User=cowrie
+Group=cowrie
+
+# Loopback only. Reach it with SSM Session Manager port forwarding:
+#   aws ssm start-session --target <instance> \
+#       --document-name AWS-StartPortForwardingSession \
+#       --parameters '{"portNumber":["8081"],"localPortNumber":["8081"]}'
+# then browse to http://127.0.0.1:8081
+#
+# Do NOT change this to 0.0.0.0. The viewer serves captured credentials and
+# session recordings and has no authentication of its own; its only access
+# control is the network boundary. server.py refuses a public bind unless it is
+# passed --i-know-this-exposes-evidence, and that flag must not appear here.
+ExecStart=/opt/cowrie/venv/bin/python3 /opt/cowrie/playback/server.py \
+    --state /opt/cowrie \
+    --host 127.0.0.1 \
+    --port 8081
+
+Restart=on-failure
+RestartSec=5
+
+# --- sandbox: the viewer has no reason to write anything ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# The state directory is mounted read-only: the viewer can never modify or
+# destroy evidence, even if it is compromised.
+ReadOnlyPaths=/opt/cowrie
+ReadWritePaths=/dev/null
+
+# A recording is untrusted input, but parsing a large one should not be able to
+# exhaust the host.
+MemoryMax=512M
+CPUQuota=50%
+TasksMax=64
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cowrie-playback

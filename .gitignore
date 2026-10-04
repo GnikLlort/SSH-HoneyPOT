@@ -1,0 +1,24 @@
+# Local virtualenv for building the profile and running the tests.
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Generated profile. Reproducible from realism/identity.yaml in under a second,
+# so it does not belong in version control - a committed fs.pickle would be a
+# 1.6 MB binary that can silently drift from the manifest that produced it.
+build/
+realism/generated/
+
+# The local test lab: a running Cowrie state directory. Contains captured
+# credentials, session recordings and uploaded files from test sessions.
+# This is test data, never production evidence, and it must not be committed.
+lab/
+
+# Anything that looks like real evidence or real secrets.
+*.env
+!.env.example
+*.pem
+*.key
+!*/ssh_host_*_key.pub
+cowrie-logship.env

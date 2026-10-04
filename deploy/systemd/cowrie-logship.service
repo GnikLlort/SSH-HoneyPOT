@@ -1,0 +1,20 @@
+[Unit]
+Description=Ship Cowrie honeypot logs and captured files to the evidence store
+Documentation=file:/opt/cowrie/DEPLOYMENT.txt
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Environment=TZ=UTC
+EnvironmentFile=-/etc/cowrie-logship.env
+ExecStart=/usr/local/sbin/quarantine_sync.sh
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=600
+# Shipping must not be able to fill the disk it is draining.
+ReadWritePaths=/opt/cowrie
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes

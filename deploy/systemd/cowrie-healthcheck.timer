@@ -1,0 +1,15 @@
+# Runs the health check every 5 minutes with a small randomised delay so that
+# many honeypot instances do not report at the same instant.
+[Unit]
+Description=Run the Cowrie honeypot health check every 5 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30
+AccuracySec=30s
+Persistent=true
+Unit=cowrie-healthcheck.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,29 @@
+# Logrotate policy for the honeypot. Installs to /etc/logrotate.d/cowrie
+#
+# Cowrie's own `logtype = rotating` rotates at midnight. This policy is the
+# second layer: it bounds total size, so a flood of events cannot fill the
+# volume between midnights, and it compresses old files to reduce the footprint
+# of what has not been shipped yet.
+#
+# `create` deliberately preserves the honeypot's owner/mode. A rotated log that
+# ends up world-readable would expose captured credentials.
+
+/opt/cowrie/var/log/cowrie/*.log
+/opt/cowrie/var/log/cowrie/*.json {
+    daily
+    rotate 14
+    maxsize 256M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    # `copytruncate` is required: Cowrie holds the file open and does not
+    # reopen it on SIGUSR1. Without it, writes continue to the rotated inode
+    # and the new file stays empty - which looks exactly like "the honeypot
+    # stopped recording".
+    copytruncate
+    create 0640 cowrie cowrie
+    su cowrie cowrie
+    dateext
+    dateformat -%Y-%m-%d
+}

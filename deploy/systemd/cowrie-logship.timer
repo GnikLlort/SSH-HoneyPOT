@@ -1,0 +1,16 @@
+# Ships evidence off the honeypot frequently. A visitor who gains enough
+# control to delete local logs must not be able to erase what has already
+# been forwarded.
+[Unit]
+Description=Ship honeypot evidence every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=60
+AccuracySec=30s
+Persistent=true
+Unit=cowrie-logship.service
+
+[Install]
+WantedBy=timers.target
